@@ -21,7 +21,7 @@ using json = nlohmann::json;
  * 
  * Bencode 支持四种数据类型：
  * 1. 字符串 (Strings): 格式为 "<长度>:<内容>"，例如 "5:hello" 表示字符串 "hello"
- * 2. 整数 (Integers): 格式为 "i<数字>e"，例如 "i52e" 表示整数 52（待实现）
+ * 2. 整数 (Integers): 格式为 "i<数字>e"，例如 "i52e" 表示整数 52，"i-52e" 表示 -52
  * 3. 列表 (Lists): 格式为 "l<元素>e"，例如 "l5:helloi52ee"（待实现）
  * 4. 字典 (Dictionaries): 格式为 "d<键值对>e"（待实现）
  * 
@@ -64,10 +64,40 @@ json decode_bencoded_value(const std::string& encoded_value)
             throw std::runtime_error("Invalid encoded value: " + encoded_value);
         }
     } 
+    else if (encoded_value[0] == 'i')
+    {
+        // 解码 Bencode 整数
+        // 格式: "i<数字>e"
+        // 示例: "i52e" -> 52
+        //       "i-52e" -> -52
+        //       "i0e" -> 0
+        
+        // 查找结束标记 'e' 的位置
+        size_t end_index = encoded_value.find('e');
+        
+        if (end_index != std::string::npos)
+        {
+            // 提取数字部分（'i' 和 'e' 之间的内容）
+            // substr(1, end_index - 1) 从索引 1 开始，长度为 end_index - 1
+            std::string number_string = encoded_value.substr(1, end_index - 1);
+            
+            // 将数字字符串转换为 64 位整数
+            // 支持正数、负数和零
+            int64_t number = std::atoll(number_string.c_str());
+            
+            // 将整数包装为 JSON 对象并返回
+            return json(number);
+        }
+        else
+        {
+            // 整数格式错误：缺少结束标记 'e'
+            throw std::runtime_error("Invalid encoded integer: " + encoded_value);
+        }
+    }
     else 
     {
-        // 当前仅支持字符串类型
-        // TODO: 添加对整数 (i...e)、列表 (l...e)、字典 (d...e) 的支持
+        // 当前仅支持字符串和整数类型
+        // TODO: 添加对列表 (l...e)、字典 (d...e) 的支持
         throw std::runtime_error("Unhandled encoded value: " + encoded_value);
     }
 }
@@ -80,7 +110,8 @@ json decode_bencoded_value(const std::string& encoded_value)
  * 
  * 示例:
  *   ./your_program decode "5:hello"    -> 输出: "hello"
- *   ./your_program decode "10:hello12345" -> 输出: "hello12345"
+ *   ./your_program decode "i52e"       -> 输出: 52
+ *   ./your_program decode "i-52e"      -> 输出: -52
  * 
  * @param argc 命令行参数数量
  * @param argv 命令行参数数组
