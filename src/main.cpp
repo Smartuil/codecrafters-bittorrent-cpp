@@ -689,6 +689,22 @@ int main(int argc, char* argv[])
         std::string info_hash = SHA1::hash(info_dict);
         // 3. 转换为十六进制并输出
         std::cout << "Info Hash: " << to_hex(info_hash) << std::endl;
+        
+        // 提取并输出 Piece Length（每个分片的字节数）
+        int64_t piece_length = torrent["info"]["piece length"].get<int64_t>();
+        std::cout << "Piece Length: " << piece_length << std::endl;
+        
+        // 提取并输出 Piece Hashes
+        // pieces 字段是所有分片 SHA-1 哈希值的拼接（每个哈希 20 字节）
+        std::string pieces = torrent["info"]["pieces"].get<std::string>();
+        std::cout << "Piece Hashes:" << std::endl;
+        
+        // 每 20 字节是一个 SHA-1 哈希，遍历并转换为十六进制输出
+        for (size_t i = 0; i < pieces.size(); i += 20)
+        {
+            std::string piece_hash = pieces.substr(i, 20);
+            std::cout << to_hex(piece_hash) << std::endl;
+        }
     } 
     else 
     {
