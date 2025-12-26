@@ -80,6 +80,8 @@
 #include <vector>
 #include <cctype>
 #include <cstdlib>
+#include <fstream>    // 文件读取
+#include <sstream>    // 字符串流
 
 #include "lib/nlohmann/json.hpp"
 
@@ -325,16 +327,41 @@ json decode_bencoded_value(const std::string& encoded_value)
 }
 
 /**
+ * @brief 读取文件内容为字符串
+ * 
+ * 以二进制模式读取文件，确保能正确处理非 UTF-8 字符（如 SHA-1 哈希）
+ * 
+ * @param file_path 文件路径
+ * @return std::string 文件内容
+ */
+std::string read_file(const std::string& file_path)
+{
+    // 以二进制模式打开文件，避免换行符转换等问题
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file)
+    {
+        throw std::runtime_error("Failed to open file: " + file_path);
+    }
+    
+    // 使用 stringstream 读取整个文件内容
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    return ss.str();
+}
+
+/**
  * @brief 程序主入口
  * 
  * 命令行用法:
  *   ./your_program decode <encoded_value>
+ *   ./your_program info <torrent_file>
  * 
  * 示例:
  *   ./your_program decode "5:hello"              -> 输出: "hello"
  *   ./your_program decode "i52e"                 -> 输出: 52
  *   ./your_program decode "l5:helloi52ee"        -> 输出: ["hello",52]
  *   ./your_program decode "d3:foo3:bar5:helloi52ee" -> 输出: {"foo":"bar","hello":52}
+ *   ./your_program info sample.torrent           -> 输出: Tracker URL 和 Length
  * 
  * @param argc 命令行参数数量
  * @param argv 命令行参数数组
@@ -379,6 +406,40 @@ int main(int argc, char* argv[])
         // 将解码结果以 JSON 格式输出到 stdout
         // dump() 方法将 JSON 对象序列化为字符串
         std::cout << decoded_value.dump() << std::endl;
+    }
+    else if (command == "info")
+    {
+        // ================================================================
+        // 处理 "info" 命令 - 解析 torrent 文件并输出元信息
+        // ================================================================
+        // torrent 文件结构（Bencode 编码的字典）:
+        //   - announce: tracker URL（字符串）
+        //   - info: 字典，包含:
+        //       - length: 文件大小（字节）
+        //       - name: 建议的文件名
+        //       - piece length: 每个分片的大小
+        //       - pieces: 所有分片的 SHA-1 哈希值拼接
+        
+        if (argc < 3)
+        {
+            std::cerr << "Usage: " << argv[0] << " info <torrent_file>" << std::endl;
+            return 1;
+        }
+        
+        // 读取 torrent 文件内容（二进制模式）
+        std::string torrent_file = argv[2];
+        std::string file_content = read_file(torrent_file);
+        
+        // 解析 Bencode 编码的 torrent 文件
+        json torrent = decode_bencoded_value(file_content);
+        
+        // 提取并输出 Tracker URL
+        std::string tracker_url = torrent["announce"].get<std::string>();
+        std::cout << "Tracker URL: " << tracker_url << std::endl;
+        
+        // 提取并输出文件长度
+        int64_t length = torrent["info"]["length"].get<int64_t>();
+        std::cout << "Length: " << length << std::endl;
     } 
     else 
     {
