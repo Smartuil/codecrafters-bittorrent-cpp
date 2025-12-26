@@ -86,6 +86,23 @@
 #include <cstdint>    // 固定宽度整数类型
 #include <cstring>    // memcpy
 
+// 网络相关头文件
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+    #include <unistd.h>
+    #define SOCKET int
+    #define INVALID_SOCKET -1
+    #define SOCKET_ERROR -1
+    #define closesocket close
+#endif
+
 #include "lib/nlohmann/json.hpp"
 
 using json = nlohmann::json;
@@ -585,6 +602,223 @@ std::string extract_info_dict(const std::string& file_content)
     return file_content.substr(dict_start, pos - dict_start);
 }
 
+// ============================================================================
+// URL 编码和 HTTP 请求功能
+// ============================================================================
+
+/**
+ * @brief URL 编码二进制数据
+ * 
+ * 将二进制数据（如 info_hash）转换为 URL 编码格式
+ * 例如: 字节 0xD6 编码为 "%D6"
+ * 
+ * @param data 要编码的二进制数据
+ * @return std::string URL 编码后的字符串
+ */
+std::string url_encode(const std::string& data)
+{
+    std::ostringstream encoded;
+    encoded << std::hex << std::uppercase << std::setfill('0');
+    
+    for (unsigned char c : data)
+    {
+        // 字母数字和 -_.~ 不需要编码
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+        {
+            encoded << c;
+        }
+        else
+        {
+            encoded << '%' << std::setw(2) << static_cast<int>(c);
+        }
+    }
+    
+    return encoded.str();
+}
+
+/**
+ * @brief 解析 URL，提取 host、port 和 path
+ * 
+ * @param url 完整的 URL
+ * @param host 输出: 主机名
+ * @param port 输出: 端口号
+ * @param path 输出: 路径
+ */
+void parse_url(const std::string& url, std::string& host, int& port, std::string& path)
+{
+    // 跳过 "http://"
+    size_t start = url.find("://");
+    if (start == std::string::npos)
+    {
+        start = 0;
+    }
+    else
+    {
+        start += 3;
+    }
+    
+    // 查找路径开始位置
+    size_t path_start = url.find('/', start);
+    if (path_start == std::string::npos)
+    {
+        path = "/";
+        path_start = url.length();
+    }
+    else
+    {
+        path = url.substr(path_start);
+    }
+    
+    // 提取 host:port
+    std::string host_port = url.substr(start, path_start - start);
+    
+    // 查找端口分隔符
+    size_t colon = host_port.find(':');
+    if (colon == std::string::npos)
+    {
+        host = host_port;
+        port = 80;  // 默认 HTTP 端口
+    }
+    else
+    {
+        host = host_port.substr(0, colon);
+        port = std::stoi(host_port.substr(colon + 1));
+    }
+}
+
+/**
+ * @brief 发送 HTTP GET 请求并返回响应体
+ * 
+ * @param url 请求的 URL（包含查询参数）
+ * @return std::string HTTP 响应体
+ */
+std::string http_get(const std::string& url)
+{
+    std::string host, path;
+    int port;
+    parse_url(url, host, port, path);
+    
+#ifdef _WIN32
+    // Windows: 初始化 Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+        throw std::runtime_error("WSAStartup failed");
+    }
+#endif
+    
+    // 解析主机名
+    struct addrinfo hints{}, *result;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result) != 0)
+    {
+        throw std::runtime_error("Failed to resolve host: " + host);
+    }
+    
+    // 创建 socket
+    SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (sock == INVALID_SOCKET)
+    {
+        freeaddrinfo(result);
+        throw std::runtime_error("Failed to create socket");
+    }
+    
+    // 连接到服务器
+    if (connect(sock, result->ai_addr, static_cast<int>(result->ai_addrlen)) == SOCKET_ERROR)
+    {
+        closesocket(sock);
+        freeaddrinfo(result);
+        throw std::runtime_error("Failed to connect to server");
+    }
+    
+    freeaddrinfo(result);
+    
+    // 构建 HTTP 请求
+    std::ostringstream request;
+    request << "GET " << path << " HTTP/1.1\r\n";
+    request << "Host: " << host << "\r\n";
+    request << "Connection: close\r\n";
+    request << "\r\n";
+    
+    std::string request_str = request.str();
+    
+    // 发送请求
+    if (send(sock, request_str.c_str(), static_cast<int>(request_str.size()), 0) == SOCKET_ERROR)
+    {
+        closesocket(sock);
+        throw std::runtime_error("Failed to send request");
+    }
+    
+    // 接收响应
+    std::string response;
+    char buffer[4096];
+    int bytes_received;
+    
+    while ((bytes_received = recv(sock, buffer, sizeof(buffer), 0)) > 0)
+    {
+        response.append(buffer, bytes_received);
+    }
+    
+    closesocket(sock);
+    
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    
+    // 解析 HTTP 响应，提取响应体
+    // HTTP 响应头和响应体之间用 \r\n\r\n 分隔
+    size_t body_start = response.find("\r\n\r\n");
+    if (body_start == std::string::npos)
+    {
+        throw std::runtime_error("Invalid HTTP response");
+    }
+    
+    return response.substr(body_start + 4);
+}
+
+/**
+ * @brief 从 tracker 响应中解析 peers 列表
+ * 
+ * Tracker 返回的 peers 是紧凑格式：每 6 字节表示一个 peer
+ * - 前 4 字节: IP 地址（大端序）
+ * - 后 2 字节: 端口号（大端序）
+ * 
+ * @param peers_data 紧凑格式的 peers 数据
+ * @return std::vector<std::string> 解析后的 peer 列表（格式: "IP:port"）
+ */
+std::vector<std::string> parse_peers(const std::string& peers_data)
+{
+    std::vector<std::string> peers;
+    
+    // 每 6 字节是一个 peer
+    for (size_t i = 0; i + 5 < peers_data.size(); i += 6)
+    {
+        // 提取 IP 地址（4 字节）
+        unsigned char ip1 = static_cast<unsigned char>(peers_data[i]);
+        unsigned char ip2 = static_cast<unsigned char>(peers_data[i + 1]);
+        unsigned char ip3 = static_cast<unsigned char>(peers_data[i + 2]);
+        unsigned char ip4 = static_cast<unsigned char>(peers_data[i + 3]);
+        
+        // 提取端口号（2 字节，大端序）
+        uint16_t port = (static_cast<unsigned char>(peers_data[i + 4]) << 8) |
+                        static_cast<unsigned char>(peers_data[i + 5]);
+        
+        // 格式化为 "IP:port"
+        std::ostringstream peer;
+        peer << static_cast<int>(ip1) << "."
+             << static_cast<int>(ip2) << "."
+             << static_cast<int>(ip3) << "."
+             << static_cast<int>(ip4) << ":"
+             << port;
+        
+        peers.push_back(peer.str());
+    }
+    
+    return peers;
+}
+
 /**
  * @brief 程序主入口
  * 
@@ -704,6 +938,66 @@ int main(int argc, char* argv[])
         {
             std::string piece_hash = pieces.substr(i, 20);
             std::cout << to_hex(piece_hash) << std::endl;
+        }
+    }
+    else if (command == "peers")
+    {
+        // ================================================================
+        // 处理 "peers" 命令 - 从 tracker 获取 peers 列表
+        // ================================================================
+        // 向 tracker 发送 GET 请求，包含以下参数:
+        //   - info_hash: torrent 的 info hash（20 字节，URL 编码）
+        //   - peer_id: 客户端标识（20 字节）
+        //   - port: 监听端口
+        //   - uploaded/downloaded/left: 传输统计
+        //   - compact: 使用紧凑格式
+        
+        if (argc < 3)
+        {
+            std::cerr << "Usage: " << argv[0] << " peers <torrent_file>" << std::endl;
+            return 1;
+        }
+        
+        // 读取并解析 torrent 文件
+        std::string torrent_file = argv[2];
+        std::string file_content = read_file(torrent_file);
+        json torrent = decode_bencoded_value(file_content);
+        
+        // 获取 tracker URL
+        std::string tracker_url = torrent["announce"].get<std::string>();
+        
+        // 获取文件长度
+        int64_t length = torrent["info"]["length"].get<int64_t>();
+        
+        // 计算 info hash（20 字节二进制）
+        std::string info_dict = extract_info_dict(file_content);
+        std::string info_hash = SHA1::hash(info_dict);
+        
+        // 构建请求 URL
+        std::ostringstream url;
+        url << tracker_url;
+        url << "?info_hash=" << url_encode(info_hash);
+        url << "&peer_id=" << "00112233445566778899";  // 20 字节的 peer_id
+        url << "&port=" << 6881;
+        url << "&uploaded=" << 0;
+        url << "&downloaded=" << 0;
+        url << "&left=" << length;
+        url << "&compact=" << 1;
+        
+        // 发送请求并获取响应
+        std::string response = http_get(url.str());
+        
+        // 解析 Bencode 响应
+        json tracker_response = decode_bencoded_value(response);
+        
+        // 获取 peers 数据并解析
+        std::string peers_data = tracker_response["peers"].get<std::string>();
+        std::vector<std::string> peers = parse_peers(peers_data);
+        
+        // 输出每个 peer
+        for (const auto& peer : peers)
+        {
+            std::cout << peer << std::endl;
         }
     } 
     else 
