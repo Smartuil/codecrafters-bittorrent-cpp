@@ -85,6 +85,7 @@
 #include <iomanip>    // 十六进制格式化输出
 #include <cstdint>    // 固定宽度整数类型
 #include <cstring>    // memcpy
+#include <random>     // 随机数生成
 
 // 网络相关头文件
 #ifdef _WIN32
@@ -637,6 +638,36 @@ std::string url_encode(const std::string& data)
 }
 
 /**
+ * @brief 生成随机的 20 字节 peer_id
+ * 
+ * 格式: -CC0001-<12个随机字符>
+ * - CC: 客户端标识 (CodeCrafters)
+ * - 0001: 版本号
+ * - 后面12个字符随机生成
+ * 
+ * @return std::string 20 字节的 peer_id
+ */
+std::string generate_peer_id()
+{
+    std::string peer_id = "-CC0001-";  // 8 字节前缀
+    
+    // 使用随机设备和 Mersenne Twister 生成器
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 61);  // 0-9, a-z, A-Z
+    
+    const char charset[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    
+    // 生成剩余 12 个随机字符
+    for (int i = 0; i < 12; i++)
+    {
+        peer_id += charset[dis(gen)];
+    }
+    
+    return peer_id;
+}
+
+/**
  * @brief 解析 URL，提取 host、port 和 path
  * 
  * @param url 完整的 URL
@@ -977,7 +1008,7 @@ int main(int argc, char* argv[])
         std::ostringstream url;
         url << tracker_url;
         url << "?info_hash=" << url_encode(info_hash);
-        url << "&peer_id=" << "00112233445566778899";  // 20 字节的 peer_id
+        url << "&peer_id=" << generate_peer_id();  // 随机生成的 20 字节 peer_id
         url << "&port=" << 6881;
         url << "&uploaded=" << 0;
         url << "&downloaded=" << 0;
