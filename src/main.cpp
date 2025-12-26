@@ -82,10 +82,213 @@
 #include <cstdlib>
 #include <fstream>    // 文件读取
 #include <sstream>    // 字符串流
+#include <iomanip>    // 十六进制格式化输出
+#include <cstdint>    // 固定宽度整数类型
+#include <cstring>    // memcpy
 
 #include "lib/nlohmann/json.hpp"
 
 using json = nlohmann::json;
+
+// ============================================================================
+// SHA-1 哈希算法实现
+// ============================================================================
+// SHA-1 (Secure Hash Algorithm 1) 产生 160 位 (20 字节) 的哈希值
+// 用于计算 torrent 文件的 Info Hash
+
+/**
+ * @brief SHA-1 哈希计算类
+ * 
+ * 实现 SHA-1 算法，用于计算 info 字典的哈希值
+ */
+class SHA1 
+{
+public:
+    SHA1() { reset(); }
+    
+    /**
+     * @brief 更新哈希计算，添加更多数据
+     * @param data 要添加的数据
+     * @param len 数据长度
+     */
+    void update(const uint8_t* data, size_t len)
+    {
+        size_t i = 0;
+        size_t index = (count[0] >> 3) & 0x3F;
+        
+        count[0] += static_cast<uint32_t>(len << 3);
+        if (count[0] < (len << 3)) count[1]++;
+        count[1] += static_cast<uint32_t>(len >> 29);
+        
+        size_t partLen = 64 - index;
+        
+        if (len >= partLen) 
+        {
+            std::memcpy(&buffer[index], data, partLen);
+            transform(buffer);
+            
+            for (i = partLen; i + 63 < len; i += 64)
+                transform(&data[i]);
+            
+            index = 0;
+        }
+        
+        std::memcpy(&buffer[index], &data[i], len - i);
+    }
+    
+    void update(const std::string& s)
+    {
+        update(reinterpret_cast<const uint8_t*>(s.c_str()), s.size());
+    }
+    
+    /**
+     * @brief 完成哈希计算并返回结果
+     * @return 20 字节的 SHA-1 哈希值
+     */
+    std::string final()
+    {
+        uint8_t finalcount[8];
+        for (uint32_t i = 0; i < 8; i++)
+            finalcount[i] = static_cast<uint8_t>((count[(i >= 4 ? 0 : 1)] >> ((3 - (i & 3)) * 8)) & 255);
+        
+        uint8_t c = 0x80;
+        update(&c, 1);
+        
+        while ((count[0] & 504) != 448)
+        {
+            c = 0x00;
+            update(&c, 1);
+        }
+        
+        update(finalcount, 8);
+        
+        std::string hash(20, '\0');
+        for (uint32_t i = 0; i < 20; i++)
+            hash[i] = static_cast<char>((state[i >> 2] >> ((3 - (i & 3)) * 8)) & 255);
+        
+        reset();
+        return hash;
+    }
+    
+    /**
+     * @brief 便捷函数：计算字符串的 SHA-1 哈希
+     * @param s 输入字符串
+     * @return 20 字节的 SHA-1 哈希值
+     */
+    static std::string hash(const std::string& s)
+    {
+        SHA1 sha1;
+        sha1.update(s);
+        return sha1.final();
+    }
+
+private:
+    uint32_t state[5];
+    uint32_t count[2];
+    uint8_t buffer[64];
+    
+    void reset()
+    {
+        state[0] = 0x67452301;
+        state[1] = 0xEFCDAB89;
+        state[2] = 0x98BADCFE;
+        state[3] = 0x10325476;
+        state[4] = 0xC3D2E1F0;
+        count[0] = count[1] = 0;
+    }
+    
+    static uint32_t rol(uint32_t value, uint32_t bits)
+    {
+        return (value << bits) | (value >> (32 - bits));
+    }
+    
+    static uint32_t blk(const uint32_t* block, uint32_t i)
+    {
+        return rol(block[(i + 13) & 15] ^ block[(i + 8) & 15] ^ block[(i + 2) & 15] ^ block[i], 1);
+    }
+    
+    static void R0(const uint32_t* block, uint32_t v, uint32_t& w, uint32_t x, uint32_t y, uint32_t& z, uint32_t i)
+    {
+        z += ((w & (x ^ y)) ^ y) + block[i] + 0x5A827999 + rol(v, 5);
+        w = rol(w, 30);
+    }
+    
+    static void R1(uint32_t* block, uint32_t v, uint32_t& w, uint32_t x, uint32_t y, uint32_t& z, uint32_t i)
+    {
+        block[i] = blk(block, i);
+        z += ((w & (x ^ y)) ^ y) + block[i] + 0x5A827999 + rol(v, 5);
+        w = rol(w, 30);
+    }
+    
+    static void R2(uint32_t* block, uint32_t v, uint32_t& w, uint32_t x, uint32_t y, uint32_t& z, uint32_t i)
+    {
+        block[i] = blk(block, i);
+        z += (w ^ x ^ y) + block[i] + 0x6ED9EBA1 + rol(v, 5);
+        w = rol(w, 30);
+    }
+    
+    static void R3(uint32_t* block, uint32_t v, uint32_t& w, uint32_t x, uint32_t y, uint32_t& z, uint32_t i)
+    {
+        block[i] = blk(block, i);
+        z += (((w | x) & y) | (w & x)) + block[i] + 0x8F1BBCDC + rol(v, 5);
+        w = rol(w, 30);
+    }
+    
+    static void R4(uint32_t* block, uint32_t v, uint32_t& w, uint32_t x, uint32_t y, uint32_t& z, uint32_t i)
+    {
+        block[i] = blk(block, i);
+        z += (w ^ x ^ y) + block[i] + 0xCA62C1D6 + rol(v, 5);
+        w = rol(w, 30);
+    }
+    
+    void transform(const uint8_t* data)
+    {
+        uint32_t block[16];
+        for (uint32_t i = 0; i < 16; i++)
+            block[i] = (data[i * 4] << 24) | (data[i * 4 + 1] << 16) | (data[i * 4 + 2] << 8) | data[i * 4 + 3];
+        
+        uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
+        
+        R0(block, a, b, c, d, e, 0);  R0(block, e, a, b, c, d, 1);  R0(block, d, e, a, b, c, 2);  R0(block, c, d, e, a, b, 3);
+        R0(block, b, c, d, e, a, 4);  R0(block, a, b, c, d, e, 5);  R0(block, e, a, b, c, d, 6);  R0(block, d, e, a, b, c, 7);
+        R0(block, c, d, e, a, b, 8);  R0(block, b, c, d, e, a, 9);  R0(block, a, b, c, d, e, 10); R0(block, e, a, b, c, d, 11);
+        R0(block, d, e, a, b, c, 12); R0(block, c, d, e, a, b, 13); R0(block, b, c, d, e, a, 14); R0(block, a, b, c, d, e, 15);
+        R1(block, e, a, b, c, d, 0);  R1(block, d, e, a, b, c, 1);  R1(block, c, d, e, a, b, 2);  R1(block, b, c, d, e, a, 3);
+        R2(block, a, b, c, d, e, 4);  R2(block, e, a, b, c, d, 5);  R2(block, d, e, a, b, c, 6);  R2(block, c, d, e, a, b, 7);
+        R2(block, b, c, d, e, a, 8);  R2(block, a, b, c, d, e, 9);  R2(block, e, a, b, c, d, 10); R2(block, d, e, a, b, c, 11);
+        R2(block, c, d, e, a, b, 12); R2(block, b, c, d, e, a, 13); R2(block, a, b, c, d, e, 14); R2(block, e, a, b, c, d, 15);
+        R2(block, d, e, a, b, c, 0);  R2(block, c, d, e, a, b, 1);  R2(block, b, c, d, e, a, 2);  R2(block, a, b, c, d, e, 3);
+        R2(block, e, a, b, c, d, 4);  R2(block, d, e, a, b, c, 5);  R2(block, c, d, e, a, b, 6);  R2(block, b, c, d, e, a, 7);
+        R3(block, a, b, c, d, e, 8);  R3(block, e, a, b, c, d, 9);  R3(block, d, e, a, b, c, 10); R3(block, c, d, e, a, b, 11);
+        R3(block, b, c, d, e, a, 12); R3(block, a, b, c, d, e, 13); R3(block, e, a, b, c, d, 14); R3(block, d, e, a, b, c, 15);
+        R3(block, c, d, e, a, b, 0);  R3(block, b, c, d, e, a, 1);  R3(block, a, b, c, d, e, 2);  R3(block, e, a, b, c, d, 3);
+        R3(block, d, e, a, b, c, 4);  R3(block, c, d, e, a, b, 5);  R3(block, b, c, d, e, a, 6);  R3(block, a, b, c, d, e, 7);
+        R3(block, e, a, b, c, d, 8);  R3(block, d, e, a, b, c, 9);  R3(block, c, d, e, a, b, 10); R3(block, b, c, d, e, a, 11);
+        R4(block, a, b, c, d, e, 12); R4(block, e, a, b, c, d, 13); R4(block, d, e, a, b, c, 14); R4(block, c, d, e, a, b, 15);
+        R4(block, b, c, d, e, a, 0);  R4(block, a, b, c, d, e, 1);  R4(block, e, a, b, c, d, 2);  R4(block, d, e, a, b, c, 3);
+        R4(block, c, d, e, a, b, 4);  R4(block, b, c, d, e, a, 5);  R4(block, a, b, c, d, e, 6);  R4(block, e, a, b, c, d, 7);
+        R4(block, d, e, a, b, c, 8);  R4(block, c, d, e, a, b, 9);  R4(block, b, c, d, e, a, 10); R4(block, a, b, c, d, e, 11);
+        R4(block, e, a, b, c, d, 12); R4(block, d, e, a, b, c, 13); R4(block, c, d, e, a, b, 14); R4(block, b, c, d, e, a, 15);
+        
+        state[0] += a; state[1] += b; state[2] += c; state[3] += d; state[4] += e;
+    }
+};
+
+/**
+ * @brief 将二进制字符串转换为十六进制字符串
+ * @param binary 二进制数据
+ * @return 十六进制字符串（小写）
+ */
+std::string to_hex(const std::string& binary)
+{
+    std::ostringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (unsigned char c : binary)
+    {
+        ss << std::setw(2) << static_cast<int>(c);
+    }
+    return ss.str();
+}
 
 /**
  * @brief 解码 Bencode 编码的值（带位置跟踪）
@@ -350,6 +553,39 @@ std::string read_file(const std::string& file_path)
 }
 
 /**
+ * @brief 从 torrent 文件内容中提取 info 字典的原始 Bencode 数据
+ * 
+ * Info Hash 需要对 info 字典的原始 Bencode 编码数据计算 SHA-1，
+ * 而不是对解析后再重新编码的数据计算。因此需要直接从原始文件中提取。
+ * 
+ * @param file_content torrent 文件的完整内容
+ * @return std::string info 字典的原始 Bencode 编码数据
+ */
+std::string extract_info_dict(const std::string& file_content)
+{
+    // 查找 "4:info" 键的位置
+    // 在 Bencode 中，"info" 键编码为 "4:info"
+    std::string info_key = "4:info";
+    size_t info_pos = file_content.find(info_key);
+    
+    if (info_pos == std::string::npos)
+    {
+        throw std::runtime_error("Could not find info dictionary in torrent file");
+    }
+    
+    // info 字典的起始位置（跳过 "4:info" 键）
+    size_t dict_start = info_pos + info_key.length();
+    
+    // 使用解码函数来确定 info 字典的结束位置
+    // 通过 pos 引用参数，解码完成后 pos 会指向字典结束后的位置
+    size_t pos = dict_start;
+    decode_bencoded_value(file_content, pos);
+    
+    // 提取 info 字典的原始 Bencode 数据
+    return file_content.substr(dict_start, pos - dict_start);
+}
+
+/**
  * @brief 程序主入口
  * 
  * 命令行用法:
@@ -419,6 +655,11 @@ int main(int argc, char* argv[])
         //       - name: 建议的文件名
         //       - piece length: 每个分片的大小
         //       - pieces: 所有分片的 SHA-1 哈希值拼接
+        //
+        // Info Hash 计算步骤:
+        //   1. 提取 info 字典的原始 Bencode 编码数据
+        //   2. 对该数据计算 SHA-1 哈希
+        //   3. 输出 40 字符的十六进制字符串
         
         if (argc < 3)
         {
@@ -440,6 +681,14 @@ int main(int argc, char* argv[])
         // 提取并输出文件长度
         int64_t length = torrent["info"]["length"].get<int64_t>();
         std::cout << "Length: " << length << std::endl;
+        
+        // 计算并输出 Info Hash
+        // 1. 提取 info 字典的原始 Bencode 数据
+        std::string info_dict = extract_info_dict(file_content);
+        // 2. 计算 SHA-1 哈希
+        std::string info_hash = SHA1::hash(info_dict);
+        // 3. 转换为十六进制并输出
+        std::cout << "Info Hash: " << to_hex(info_hash) << std::endl;
     } 
     else 
     {
