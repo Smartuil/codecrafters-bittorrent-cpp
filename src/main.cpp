@@ -86,23 +86,21 @@
 #include <cstdint>    // 固定宽度整数类型
 #include <cstring>    // memcpy
 #include <random>     // 随机数生成
+#include <stdexcept>  // std::runtime_error
 
-// 网络相关头文件
-#ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")
-#else
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-    #include <arpa/inet.h>
-    #include <netdb.h>
-    #include <unistd.h>
-    #define SOCKET int
-    #define INVALID_SOCKET -1
-    #define SOCKET_ERROR -1
-    #define closesocket close
-#endif
+
+// 网络相关头文件（Linux/POSIX）
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+
+#define SOCKET int
+#define INVALID_SOCKET -1
+#define SOCKET_ERROR -1
+#define closesocket close
+
 
 #include "lib/nlohmann/json.hpp"
 
@@ -668,6 +666,54 @@ std::string generate_peer_id()
 }
 
 /**
+ * @brief 生成指定长度的随机字节序列
+ */
+std::string generate_random_bytes(size_t length)
+{
+    std::string out(length, '\0');
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dis(0, 255);
+
+    for (size_t i = 0; i < length; i++)
+    {
+        out[i] = static_cast<char>(dis(gen));
+    }
+
+    return out;
+}
+
+/**
+ * @brief 生成握手用的 20 字节随机 peer_id（任意字节值）
+ */
+std::string generate_peer_id_bytes()
+{
+    return generate_random_bytes(20);
+}
+
+/**
+ * @brief 解析 "<host>:<port>" 字符串
+ */
+void parse_host_port(const std::string& host_port, std::string& host, int& port)
+{
+    size_t colon = host_port.rfind(':');
+    if (colon == std::string::npos)
+    {
+        throw std::runtime_error("Invalid peer address (expected <host>:<port>): " + host_port);
+    }
+
+    host = host_port.substr(0, colon);
+    std::string port_str = host_port.substr(colon + 1);
+
+    if (host.empty() || port_str.empty())
+    {
+        throw std::runtime_error("Invalid peer address (expected <host>:<port>): " + host_port);
+    }
+
+    port = std::stoi(port_str);
+}
+
+/**
  * @brief 解析 URL，提取 host、port 和 path
  * 
  * @param url 完整的 URL
@@ -728,16 +774,7 @@ std::string http_get(const std::string& url)
     std::string host, path;
     int port;
     parse_url(url, host, port, path);
-    
-#ifdef _WIN32
-    // Windows: 初始化 Winsock
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
-    {
-        throw std::runtime_error("WSAStartup failed");
-    }
-#endif
-    
+
     // 解析主机名
     struct addrinfo hints{}, *result;
     hints.ai_family = AF_INET;
@@ -791,13 +828,9 @@ std::string http_get(const std::string& url)
     {
         response.append(buffer, bytes_received);
     }
-    
+
     closesocket(sock);
-    
-#ifdef _WIN32
-    WSACleanup();
-#endif
-    
+
     // 解析 HTTP 响应，提取响应体
     // HTTP 响应头和响应体之间用 \r\n\r\n 分隔
     size_t body_start = response.find("\r\n\r\n");
@@ -808,6 +841,86 @@ std::string http_get(const std::string& url)
     
     return response.substr(body_start + 4);
 }
+
+// ============================================================================
+// TCP 工具函数（peer 握手用）
+// ============================================================================
+
+/**
+ * @brief 连接到指定 host:port，返回已连接的 socket
+ */
+SOCKET tcp_connect(const std::string& host, int port)
+{
+    struct addrinfo hints{}, *result = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result) != 0)
+    {
+        throw std::runtime_error("Failed to resolve host: " + host);
+    }
+
+    SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (sock == INVALID_SOCKET)
+    {
+        freeaddrinfo(result);
+        throw std::runtime_error("Failed to create socket");
+    }
+
+    if (connect(sock, result->ai_addr, static_cast<int>(result->ai_addrlen)) == SOCKET_ERROR)
+    {
+        closesocket(sock);
+        freeaddrinfo(result);
+        throw std::runtime_error("Failed to connect to peer");
+    }
+
+    freeaddrinfo(result);
+    return sock;
+}
+
+/**
+ * @brief 确保发送完所有数据
+ */
+void send_all(SOCKET sock, const std::string& data)
+{
+    size_t total_sent = 0;
+    while (total_sent < data.size())
+    {
+        int sent = send(sock, data.data() + total_sent, static_cast<int>(data.size() - total_sent), 0);
+        if (sent == SOCKET_ERROR || sent == 0)
+        {
+            throw std::runtime_error("Failed to send data");
+        }
+        total_sent += static_cast<size_t>(sent);
+    }
+}
+
+/**
+ * @brief 接收指定长度的字节数（不够则循环接收）
+ */
+std::string recv_exact(SOCKET sock, size_t length)
+{
+    std::string out;
+    out.resize(length);
+
+    size_t total = 0;
+    while (total < length)
+    {
+        int received = recv(sock, &out[total], static_cast<int>(length - total), 0);
+        if (received == SOCKET_ERROR)
+        {
+            throw std::runtime_error("Failed to receive data");
+        }
+        if (received == 0)
+        {
+            throw std::runtime_error("Peer closed connection");
+        }
+        total += static_cast<size_t>(received);
+    }
+
+    return out;
+}
+
 
 /**
  * @brief 从 tracker 响应中解析 peers 列表
@@ -1030,8 +1143,88 @@ int main(int argc, char* argv[])
         {
             std::cout << peer << std::endl;
         }
-    } 
-    else 
+    }
+    else if (command == "handshake")
+    {
+        // ================================================================
+        // 处理 "handshake" 命令 - 与 peer 建立 TCP 连接并完成握手
+        // ================================================================
+        // 命令行用法:
+        //   ./your_program handshake <torrent_file> <peer_ip>:<peer_port>
+
+        if (argc < 4)
+        {
+            std::cerr << "Usage: " << argv[0] << " handshake <torrent_file> <peer_ip>:<peer_port>" << std::endl;
+            return 1;
+        }
+
+        std::string torrent_file = argv[2];
+        std::string peer_addr = argv[3];
+
+        // 读取 torrent 文件并计算 info_hash（二进制 20 字节）
+        std::string file_content = read_file(torrent_file);
+        std::string info_dict = extract_info_dict(file_content);
+        std::string info_hash = SHA1::hash(info_dict);
+        if (info_hash.size() != 20)
+        {
+            throw std::runtime_error("Invalid info_hash length");
+        }
+
+        // 解析 peer 地址
+        std::string peer_host;
+        int peer_port = 0;
+        parse_host_port(peer_addr, peer_host, peer_port);
+
+        // 生成本地 peer_id（二进制 20 字节随机）
+        std::string my_peer_id = generate_peer_id_bytes();
+
+        // 组装握手消息（总长 68 字节）
+        std::string handshake;
+        handshake.reserve(68);
+        handshake.push_back(static_cast<char>(19));
+        handshake += "BitTorrent protocol";
+        handshake.append(8, '\0');
+        handshake += info_hash;
+        handshake += my_peer_id;
+
+
+        SOCKET sock = INVALID_SOCKET;
+
+        try
+        {
+            sock = tcp_connect(peer_host, peer_port);
+
+            // 发送握手
+            send_all(sock, handshake);
+
+            // 接收对端握手（68 字节）
+            std::string response = recv_exact(sock, 68);
+
+            // 解析对端 peer_id（最后 20 字节）
+            if (static_cast<unsigned char>(response[0]) != 19 || response.substr(1, 19) != "BitTorrent protocol")
+            {
+                throw std::runtime_error("Invalid handshake response");
+            }
+
+            std::string received_peer_id = response.substr(48, 20);
+            std::cout << "Peer ID: " << to_hex(received_peer_id) << std::endl;
+
+
+            closesocket(sock);
+            sock = INVALID_SOCKET;
+        }
+
+        catch (...)
+        {
+            if (sock != INVALID_SOCKET)
+            {
+                closesocket(sock);
+            }
+            throw;
+
+        }
+    }
+    else
     {
         // 未知命令，输出错误信息
         std::cerr << "unknown command: " << command << std::endl;
