@@ -88,6 +88,11 @@
 #include <random>     // 随机数生成
 #include <stdexcept>  // std::runtime_error
 #include <algorithm>  // std::min
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+
 
 
 // 网络相关头文件（Linux/POSIX）
@@ -1136,9 +1141,153 @@ std::string download_piece_from_peer(SOCKET sock, int piece_index, int64_t piece
     return piece_data;
 }
 
+// ============================================================================
+// 并发下载 work queue（download 命令用）
+// ============================================================================
+
+struct PieceWorkQueue
+{
+    std::mutex mu;
+    std::vector<uint8_t> state; // 0=pending,1=in_progress,2=done
+    std::atomic<int64_t> remaining{0};
+
+    explicit PieceWorkQueue(int64_t num_pieces)
+        : state(static_cast<size_t>(num_pieces), 0), remaining(num_pieces)
+    {
+    }
+};
+
+int acquire_next_piece(PieceWorkQueue& q, const std::string& bitfield, int64_t num_pieces)
+{
+    std::lock_guard<std::mutex> lock(q.mu);
+    if (q.remaining.load() <= 0) return -1;
+
+    for (int64_t i = 0; i < num_pieces; i++)
+    {
+        if (q.state[static_cast<size_t>(i)] != 0) continue;
+        if (!bitfield.empty() && !bitfield_has_piece(bitfield, static_cast<int>(i))) continue;
+
+        q.state[static_cast<size_t>(i)] = 1;
+        return static_cast<int>(i);
+    }
+
+    return -1;
+}
+
+void mark_piece_done(PieceWorkQueue& q, int piece_index)
+{
+    std::lock_guard<std::mutex> lock(q.mu);
+    if (piece_index < 0) return;
+    size_t idx = static_cast<size_t>(piece_index);
+    if (idx >= q.state.size()) return;
+
+    if (q.state[idx] == 1)
+    {
+        q.state[idx] = 2;
+        q.remaining.fetch_sub(1);
+    }
+}
+
+void mark_piece_retry(PieceWorkQueue& q, int piece_index)
+{
+    std::lock_guard<std::mutex> lock(q.mu);
+    if (piece_index < 0) return;
+    size_t idx = static_cast<size_t>(piece_index);
+    if (idx >= q.state.size()) return;
+
+    if (q.state[idx] == 1)
+    {
+        q.state[idx] = 0;
+    }
+}
+
+void download_worker(
+    const std::string& peer_addr,
+    const std::string& info_hash,
+    const std::string& my_peer_id,
+    int64_t total_length,
+    int64_t piece_length,
+    const std::string& pieces_blob,
+    PieceWorkQueue* queue,
+    std::vector<char>* out_buf)
+{
+    std::string peer_host;
+    int peer_port = 0;
+    parse_host_port(peer_addr, peer_host, peer_port);
+
+    SOCKET sock = INVALID_SOCKET;
+    int current_piece = -1;
+
+    try
+    {
+        sock = tcp_connect(peer_host, peer_port);
+        (void)perform_handshake(sock, info_hash, my_peer_id);
+
+        std::string bitfield = recv_bitfield_payload(sock);
+        send_peer_message(sock, 2, "");
+        wait_for_unchoke(sock);
+
+        int64_t num_pieces = static_cast<int64_t>(pieces_blob.size() / 20);
+
+        while (queue->remaining.load() > 0)
+        {
+            current_piece = acquire_next_piece(*queue, bitfield, num_pieces);
+            if (current_piece < 0)
+            {
+                // 这个 peer 没有可下载的 piece（或都被领走了）
+                break;
+            }
+
+            int64_t piece_offset = static_cast<int64_t>(current_piece) * piece_length;
+            int64_t piece_size = std::min(piece_length, total_length - piece_offset);
+            if (piece_size < 0)
+            {
+                throw std::runtime_error("Invalid piece size");
+            }
+
+            std::string expected_piece_hash = pieces_blob.substr(static_cast<size_t>(current_piece) * 20, 20);
+
+            std::string piece_data = download_piece_from_peer(sock, current_piece, piece_size);
+            std::string actual_hash = SHA1::hash(piece_data);
+            if (actual_hash != expected_piece_hash)
+            {
+                mark_piece_retry(*queue, current_piece);
+                current_piece = -1;
+                continue;
+            }
+
+            // 写入共享缓冲区（每个 piece 对应的区间互不重叠）
+            if (piece_offset + piece_size > static_cast<int64_t>(out_buf->size()))
+            {
+                throw std::runtime_error("Output buffer overflow");
+            }
+            std::memcpy(out_buf->data() + piece_offset, piece_data.data(), static_cast<size_t>(piece_size));
+
+            mark_piece_done(*queue, current_piece);
+            current_piece = -1;
+        }
+
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
+    catch (...)
+    {
+        if (current_piece >= 0)
+        {
+            mark_piece_retry(*queue, current_piece);
+        }
+        if (sock != INVALID_SOCKET)
+        {
+            closesocket(sock);
+        }
+        throw;
+    }
+}
+
 
 /**
  * @brief 从 tracker 响应中解析 peers 列表
+
  * 
  * Tracker 返回的 peers 是紧凑格式：每 6 字节表示一个 peer
  * - 前 4 字节: IP 地址（大端序）
@@ -1546,6 +1695,38 @@ int main(int argc, char* argv[])
         // ================================================================
         // 用法:
         //   ./your_program download -o <output_path> <torrent_file>
+        //
+        // 示例:
+        //   ./your_program download -o /tmp/test.txt sample.torrent
+        //
+        // 执行流程（并发下载版，work queue + 多 peer worker）：
+        //   1) 读取并解析 torrent：拿到 announce(tracker_url)、length(total_length)、piece length(piece_length)、pieces(pieces_blob)
+        //   2) 计算 info_hash：对 info 字典原始 bencode 做 SHA1（20 字节二进制）
+        //   3) 请求 tracker：GET tracker_url?info_hash=...&peer_id=...&left=...&compact=1
+        //   4) 解析 peers：tracker 返回 compact peers（每 6 字节一个 peer），得到 "ip:port" 列表
+        //   5) 初始化下载目标：
+        //      - 分配 file_data(total_length) 作为整文件缓冲区
+        //      - 初始化 PieceWorkQueue：所有 piece 初始为 pending
+        //   6) 启动多个 worker（每个 worker 绑定一个 peer 连接，最多 max_workers 个并发）：
+        //      - TCP connect 到 peer
+        //      - BitTorrent handshake：发送/接收 68 字节握手（包含 info_hash 和 peer_id）
+        //      - 等待 bitfield：收到 id=5 的 bitfield 消息，得知该 peer 拥有哪些 pieces
+        //      - 发送 interested：id=2
+        //      - 等待 unchoke：id=1（若被 choke(id=0) 会继续等到 unchoke）
+        //      - 循环领取任务：从 PieceWorkQueue 里找一个该 peer 拥有且尚未下载的 piece_index
+        //      - 下载 piece：
+        //          * 把 piece 切成 16KiB blocks
+        //          * 对每个 block 发送 request(id=6, payload=index+begin+length)
+        //          * 收到 piece(id=7, payload=index+begin+block) 后写入 piece_buffer 对应区间
+        //      - 校验 piece：对 piece_buffer 做 SHA1，必须等于 pieces_blob 中对应的 20 字节哈希
+        //      - 写入共享缓冲区：把 piece_buffer memcpy 到 file_data[piece_offset : piece_offset+piece_size]
+        //      - 标记完成：PieceWorkQueue 把该 piece 标记为 done，remaining--
+        //   7) 所有 pieces 完成后：把 file_data 一次性写入 -o 指定的输出文件
+        //
+        // 失败与重试：
+        //   - 若某个 worker 下载/校验失败，会把当前 piece 放回队列（retry），并尝试继续领取别的 piece。
+        //   - 若 peers 用尽但仍有 remaining piece，则报错 "Download incomplete"。
+
 
         if (argc < 5 || std::string(argv[2]) != "-o")
         {
@@ -1599,103 +1780,75 @@ int main(int argc, char* argv[])
             throw std::runtime_error("No peers returned by tracker");
         }
 
-        bool downloaded = false;
+        // 为了支持并发写入，把整文件先装到内存缓冲区
+        if (total_length < 0)
+        {
+            throw std::runtime_error("Invalid total length");
+        }
+        std::vector<char> file_data;
+        file_data.resize(static_cast<size_t>(total_length));
+
+        PieceWorkQueue queue(num_pieces);
+
+        // 分批启动 worker：每个 worker 使用一个 peer 连接
+        const size_t max_workers = 4;
+        size_t next_peer = 0;
         std::string last_error;
+        std::mutex err_mu;
 
-        for (const auto& peer_addr : peers)
+        while (queue.remaining.load() > 0 && next_peer < peers.size())
         {
-            std::string peer_host;
-            int peer_port = 0;
-            parse_host_port(peer_addr, peer_host, peer_port);
+            size_t batch = std::min(max_workers, peers.size() - next_peer);
+            std::vector<std::thread> threads;
+            threads.reserve(batch);
 
-            SOCKET sock = INVALID_SOCKET;
-            try
+            for (size_t i = 0; i < batch; i++)
             {
-                sock = tcp_connect(peer_host, peer_port);
-
-                // handshake
-                (void)perform_handshake(sock, info_hash, my_peer_id);
-
-                // bitfield
-                std::string bitfield = recv_bitfield_payload(sock);
-
-                // interested + unchoke
-                send_peer_message(sock, 2, "");
-                wait_for_unchoke(sock);
-
-                // 写入输出文件（若该 peer 失败，会进入 catch 并尝试下一个 peer）
-                std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
-                if (!out)
-                {
-                    throw std::runtime_error("Failed to open output file: " + output_path);
-                }
-
-                for (int64_t piece_index = 0; piece_index < num_pieces; piece_index++)
-                {
-                    int64_t piece_offset = piece_index * piece_length;
-                    int64_t piece_size = std::min(piece_length, total_length - piece_offset);
-                    if (piece_size < 0)
+                const std::string peer_addr = peers[next_peer + i];
+                threads.emplace_back([&, peer_addr]() {
+                    try
                     {
-                        throw std::runtime_error("Invalid piece size");
+                        download_worker(peer_addr, info_hash, my_peer_id, total_length, piece_length, pieces_blob, &queue, &file_data);
                     }
-
-                    if (!bitfield.empty() && !bitfield_has_piece(bitfield, static_cast<int>(piece_index)))
+                    catch (const std::exception& e)
                     {
-                        throw std::runtime_error("Peer does not have required piece");
+                        std::lock_guard<std::mutex> lock(err_mu);
+                        if (last_error.empty()) last_error = e.what();
                     }
-
-                    std::string expected_piece_hash = pieces_blob.substr(static_cast<size_t>(piece_index) * 20, 20);
-
-                    // 最多重试几次（同一个 peer）
-                    const int max_retries = 3;
-                    bool ok = false;
-                    std::string piece_data;
-                    for (int attempt = 0; attempt < max_retries && !ok; attempt++)
+                    catch (...)
                     {
-                        piece_data = download_piece_from_peer(sock, static_cast<int>(piece_index), piece_size);
-                        std::string actual_hash = SHA1::hash(piece_data);
-                        if (actual_hash == expected_piece_hash)
-                        {
-                            ok = true;
-                            break;
-                        }
+                        std::lock_guard<std::mutex> lock(err_mu);
+                        if (last_error.empty()) last_error = "worker failed";
                     }
-
-                    if (!ok)
-                    {
-                        throw std::runtime_error("Piece hash mismatch");
-                    }
-
-                    out.write(piece_data.data(), static_cast<std::streamsize>(piece_data.size()));
-                    if (!out)
-                    {
-                        throw std::runtime_error("Failed to write output file");
-                    }
-                }
-
-                out.close();
-
-                closesocket(sock);
-                sock = INVALID_SOCKET;
-
-                downloaded = true;
-                break;
+                });
             }
-            catch (const std::exception& e)
+
+            for (auto& t : threads)
             {
-                last_error = e.what();
-                if (sock != INVALID_SOCKET)
-                {
-                    closesocket(sock);
-                }
-                // 尝试下一个 peer
+                t.join();
             }
+
+            next_peer += batch;
         }
 
-        if (!downloaded)
+        if (queue.remaining.load() > 0)
         {
-            throw std::runtime_error(last_error.empty() ? "Download failed" : last_error);
+            throw std::runtime_error(last_error.empty() ? "Download incomplete" : last_error);
         }
+
+        // 所有 pieces 完成后写入文件
+        std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
+        if (!out)
+        {
+            throw std::runtime_error("Failed to open output file: " + output_path);
+        }
+        out.write(file_data.data(), static_cast<std::streamsize>(file_data.size()));
+        if (!out)
+        {
+            throw std::runtime_error("Failed to write output file");
+        }
+        out.close();
+
     }
     else
     {
