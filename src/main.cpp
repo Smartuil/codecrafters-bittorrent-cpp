@@ -1704,7 +1704,5 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-
-        return 0;  // 程序正常退出
-    }
+    return 0;  // 程序正常退出
 }
