@@ -87,9 +87,11 @@
 #include <cstring>    // memcpy
 #include <random>     // 随机数生成
 #include <stdexcept>  // std::runtime_error
+#include <algorithm>  // std::min
 
 
 // 网络相关头文件（Linux/POSIX）
+
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -921,9 +923,104 @@ std::string recv_exact(SOCKET sock, size_t length)
     return out;
 }
 
+// ============================================================================
+// Peer Message 编解码（下载 piece 用）
+// ============================================================================
+
+uint32_t read_u32_be(const std::string& buf, size_t offset)
+{
+    return (static_cast<uint32_t>(static_cast<unsigned char>(buf[offset])) << 24) |
+           (static_cast<uint32_t>(static_cast<unsigned char>(buf[offset + 1])) << 16) |
+           (static_cast<uint32_t>(static_cast<unsigned char>(buf[offset + 2])) << 8) |
+           (static_cast<uint32_t>(static_cast<unsigned char>(buf[offset + 3])));
+}
+
+void append_u32_be(std::string& out, uint32_t value)
+{
+    out.push_back(static_cast<char>((value >> 24) & 0xFF));
+    out.push_back(static_cast<char>((value >> 16) & 0xFF));
+    out.push_back(static_cast<char>((value >> 8) & 0xFF));
+    out.push_back(static_cast<char>(value & 0xFF));
+}
+
+struct PeerMessage
+{
+    uint32_t length = 0; // 不含自身 4 字节前缀
+    bool keepalive = false;
+    uint8_t id = 0;
+    std::string payload;
+};
+
+PeerMessage recv_peer_message(SOCKET sock)
+{
+    PeerMessage msg;
+    std::string len_bytes = recv_exact(sock, 4);
+    msg.length = read_u32_be(len_bytes, 0);
+
+    if (msg.length == 0)
+    {
+        msg.keepalive = true;
+        return msg;
+    }
+
+    std::string rest = recv_exact(sock, msg.length);
+    msg.id = static_cast<uint8_t>(rest[0]);
+    if (msg.length > 1)
+    {
+        msg.payload = rest.substr(1);
+    }
+
+    return msg;
+}
+
+void send_peer_message(SOCKET sock, uint8_t id, const std::string& payload)
+{
+    std::string out;
+    out.reserve(4 + 1 + payload.size());
+
+    uint32_t length = static_cast<uint32_t>(1 + payload.size());
+    append_u32_be(out, length);
+    out.push_back(static_cast<char>(id));
+    out += payload;
+
+    send_all(sock, out);
+}
+
+std::string build_handshake(const std::string& info_hash, const std::string& peer_id)
+{
+    if (info_hash.size() != 20) throw std::runtime_error("Invalid info_hash length");
+    if (peer_id.size() != 20) throw std::runtime_error("Invalid peer_id length");
+
+    std::string handshake;
+    handshake.reserve(68);
+    handshake.push_back(static_cast<char>(19));
+    handshake += "BitTorrent protocol";
+    handshake.append(8, '\0');
+    handshake += info_hash;
+    handshake += peer_id;
+    return handshake;
+}
+
+std::string perform_handshake(SOCKET sock, const std::string& info_hash, const std::string& my_peer_id)
+{
+    std::string hs = build_handshake(info_hash, my_peer_id);
+    send_all(sock, hs);
+
+    std::string response = recv_exact(sock, 68);
+    if (static_cast<unsigned char>(response[0]) != 19 || response.substr(1, 19) != "BitTorrent protocol")
+    {
+        throw std::runtime_error("Invalid handshake response");
+    }
+
+    // reserved(8) + info_hash(20) + peer_id(20)
+    std::string received_peer_id = response.substr(48, 20);
+    return received_peer_id;
+}
+
 
 /**
  * @brief 从 tracker 响应中解析 peers 列表
+
  * 
  * Tracker 返回的 peers 是紧凑格式：每 6 字节表示一个 peer
  * - 前 4 字节: IP 地址（大端序）
@@ -1165,10 +1262,6 @@ int main(int argc, char* argv[])
         std::string file_content = read_file(torrent_file);
         std::string info_dict = extract_info_dict(file_content);
         std::string info_hash = SHA1::hash(info_dict);
-        if (info_hash.size() != 20)
-        {
-            throw std::runtime_error("Invalid info_hash length");
-        }
 
         // 解析 peer 地址
         std::string peer_host;
@@ -1178,42 +1271,17 @@ int main(int argc, char* argv[])
         // 生成本地 peer_id（二进制 20 字节随机）
         std::string my_peer_id = generate_peer_id_bytes();
 
-        // 组装握手消息（总长 68 字节）
-        std::string handshake;
-        handshake.reserve(68);
-        handshake.push_back(static_cast<char>(19));
-        handshake += "BitTorrent protocol";
-        handshake.append(8, '\0');
-        handshake += info_hash;
-        handshake += my_peer_id;
-
-
         SOCKET sock = INVALID_SOCKET;
-
         try
         {
             sock = tcp_connect(peer_host, peer_port);
 
-            // 发送握手
-            send_all(sock, handshake);
-
-            // 接收对端握手（68 字节）
-            std::string response = recv_exact(sock, 68);
-
-            // 解析对端 peer_id（最后 20 字节）
-            if (static_cast<unsigned char>(response[0]) != 19 || response.substr(1, 19) != "BitTorrent protocol")
-            {
-                throw std::runtime_error("Invalid handshake response");
-            }
-
-            std::string received_peer_id = response.substr(48, 20);
+            std::string received_peer_id = perform_handshake(sock, info_hash, my_peer_id);
             std::cout << "Peer ID: " << to_hex(received_peer_id) << std::endl;
-
 
             closesocket(sock);
             sock = INVALID_SOCKET;
         }
-
         catch (...)
         {
             if (sock != INVALID_SOCKET)
@@ -1221,7 +1289,186 @@ int main(int argc, char* argv[])
                 closesocket(sock);
             }
             throw;
+        }
+    }
+    else if (command == "download_piece")
+    {
+        // ================================================================
+        // 处理 "download_piece" 命令 - 下载指定 piece 并写入文件
+        // ================================================================
+        // 用法:
+        //   ./your_program download_piece -o <output_path> <torrent_file> <piece_index>
 
+        if (argc < 6 || std::string(argv[2]) != "-o")
+        {
+            std::cerr << "Usage: " << argv[0] << " download_piece -o <output_path> <torrent_file> <piece_index>" << std::endl;
+            return 1;
+        }
+
+        std::string output_path = argv[3];
+        std::string torrent_file = argv[4];
+        int piece_index = std::stoi(argv[5]);
+        if (piece_index < 0)
+        {
+            throw std::runtime_error("Invalid piece_index");
+        }
+
+        // 读取并解析 torrent
+        std::string file_content = read_file(torrent_file);
+        json torrent = decode_bencoded_value(file_content);
+
+        std::string tracker_url = torrent["announce"].get<std::string>();
+        int64_t total_length = torrent["info"]["length"].get<int64_t>();
+        int64_t piece_length = torrent["info"]["piece length"].get<int64_t>();
+        std::string pieces_blob = torrent["info"]["pieces"].get<std::string>();
+
+        // 计算 info_hash（二进制 20 字节）
+        std::string info_dict = extract_info_dict(file_content);
+        std::string info_hash = SHA1::hash(info_dict);
+
+        // piece 边界检查 + 计算本 piece 实际长度
+        int64_t num_pieces = static_cast<int64_t>(pieces_blob.size() / 20);
+        if (piece_index >= num_pieces)
+        {
+            throw std::runtime_error("piece_index out of range");
+        }
+
+        int64_t piece_offset = static_cast<int64_t>(piece_index) * piece_length;
+        if (piece_offset >= total_length)
+        {
+            throw std::runtime_error("piece_index out of file range");
+        }
+
+        int64_t piece_size = std::min(piece_length, total_length - piece_offset);
+        std::string expected_piece_hash = pieces_blob.substr(static_cast<size_t>(piece_index) * 20, 20);
+
+        // tracker 请求 peers
+        std::ostringstream url;
+        url << tracker_url;
+        url << "?info_hash=" << url_encode(info_hash);
+        url << "&peer_id=" << generate_peer_id();
+        url << "&port=" << 6881;
+        url << "&uploaded=" << 0;
+        url << "&downloaded=" << 0;
+        url << "&left=" << total_length;
+        url << "&compact=" << 1;
+
+        std::string tracker_resp_raw = http_get(url.str());
+        json tracker_resp = decode_bencoded_value(tracker_resp_raw);
+
+        std::string peers_data = tracker_resp["peers"].get<std::string>();
+        std::vector<std::string> peers = parse_peers(peers_data);
+        if (peers.empty())
+        {
+            throw std::runtime_error("No peers returned by tracker");
+        }
+
+        // 选择第一个 peer
+        std::string peer_host;
+        int peer_port = 0;
+        parse_host_port(peers[0], peer_host, peer_port);
+
+        SOCKET sock = INVALID_SOCKET;
+        try
+        {
+            sock = tcp_connect(peer_host, peer_port);
+
+            // handshake
+            std::string my_peer_id = generate_peer_id_bytes();
+            (void)perform_handshake(sock, info_hash, my_peer_id);
+
+            // 1) 等 bitfield (id=5)
+            while (true)
+            {
+                PeerMessage msg = recv_peer_message(sock);
+                if (msg.keepalive) continue;
+                if (msg.id == 5) break;
+            }
+
+            // 2) 发送 interested (id=2)
+            send_peer_message(sock, 2, "");
+
+            // 3) 等 unchoke (id=1)
+            while (true)
+            {
+                PeerMessage msg = recv_peer_message(sock);
+                if (msg.keepalive) continue;
+                if (msg.id == 1) break;
+            }
+
+            // 4) 按 16KiB block 逐块 request，并等待 piece 返回
+            const int64_t block_size = 16 * 1024;
+            std::string piece_data;
+            piece_data.resize(static_cast<size_t>(piece_size));
+
+            for (int64_t begin = 0; begin < piece_size; begin += block_size)
+            {
+                int64_t req_len = std::min(block_size, piece_size - begin);
+
+                // request payload: index(4) + begin(4) + length(4)
+                std::string payload;
+                payload.reserve(12);
+                append_u32_be(payload, static_cast<uint32_t>(piece_index));
+                append_u32_be(payload, static_cast<uint32_t>(begin));
+                append_u32_be(payload, static_cast<uint32_t>(req_len));
+                send_peer_message(sock, 6, payload);
+
+                // 等 piece (id=7)
+                while (true)
+                {
+                    PeerMessage msg = recv_peer_message(sock);
+                    if (msg.keepalive) continue;
+                    if (msg.id != 7) continue;
+
+                    if (msg.payload.size() < 8)
+                    {
+                        throw std::runtime_error("Invalid piece message payload");
+                    }
+
+                    uint32_t resp_index = read_u32_be(msg.payload, 0);
+                    uint32_t resp_begin = read_u32_be(msg.payload, 4);
+                    if (resp_index != static_cast<uint32_t>(piece_index) || resp_begin != static_cast<uint32_t>(begin))
+                    {
+                        continue;
+                    }
+
+                    std::string block = msg.payload.substr(8);
+                    if (static_cast<int64_t>(block.size()) != req_len)
+                    {
+                        throw std::runtime_error("Unexpected block length");
+                    }
+
+                    std::memcpy(&piece_data[static_cast<size_t>(begin)], block.data(), block.size());
+                    break;
+                }
+            }
+
+            // 5) 校验 piece hash
+            std::string actual_hash = SHA1::hash(piece_data);
+            if (actual_hash != expected_piece_hash)
+            {
+                throw std::runtime_error("Piece hash mismatch");
+            }
+
+            // 6) 写入文件
+            std::ofstream out(output_path, std::ios::binary);
+            if (!out)
+            {
+                throw std::runtime_error("Failed to open output file: " + output_path);
+            }
+            out.write(piece_data.data(), static_cast<std::streamsize>(piece_data.size()));
+            out.close();
+
+            closesocket(sock);
+            sock = INVALID_SOCKET;
+        }
+        catch (...)
+        {
+            if (sock != INVALID_SOCKET)
+            {
+                closesocket(sock);
+            }
+            throw;
         }
     }
     else
