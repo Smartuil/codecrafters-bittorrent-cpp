@@ -643,6 +643,109 @@ std::string url_encode(const std::string& data)
 }
 
 /**
+ * @brief URL 解码
+ * 
+ * 将 URL 编码的字符串解码为原始字符串
+ * 例如: "%2F" 解码为 "/"
+ * 
+ * @param data URL 编码的字符串
+ * @return std::string 解码后的字符串
+ */
+std::string url_decode(const std::string& data)
+{
+    std::string decoded;
+    decoded.reserve(data.size());
+    
+    for (size_t i = 0; i < data.size(); i++)
+    {
+        if (data[i] == '%' && i + 2 < data.size())
+        {
+            // 解码 %XX 格式
+            std::string hex = data.substr(i + 1, 2);
+            char c = static_cast<char>(std::stoi(hex, nullptr, 16));
+            decoded += c;
+            i += 2;
+        }
+        else if (data[i] == '+')
+        {
+            // '+' 在 URL 中表示空格
+            decoded += ' ';
+        }
+        else
+        {
+            decoded += data[i];
+        }
+    }
+    
+    return decoded;
+}
+
+/**
+ * @brief 解析磁力链接
+ * 
+ * 从磁力链接中提取 info hash 和 tracker URL
+ * 
+ * @param magnet_link 磁力链接字符串
+ * @param info_hash 输出: info hash（40 字符十六进制）
+ * @param tracker_url 输出: tracker URL
+ */
+void parse_magnet_link(const std::string& magnet_link, std::string& info_hash, std::string& tracker_url)
+{
+    // 磁力链接格式: magnet:?xt=urn:btih:<info_hash>&dn=<name>&tr=<tracker_url>
+    
+    // 查找查询参数开始位置
+    size_t query_start = magnet_link.find('?');
+    if (query_start == std::string::npos)
+    {
+        throw std::runtime_error("Invalid magnet link: no query parameters");
+    }
+    
+    std::string query = magnet_link.substr(query_start + 1);
+    
+    // 解析查询参数
+    size_t pos = 0;
+    while (pos < query.size())
+    {
+        // 查找参数结束位置
+        size_t amp_pos = query.find('&', pos);
+        std::string param;
+        if (amp_pos == std::string::npos)
+        {
+            param = query.substr(pos);
+            pos = query.size();
+        }
+        else
+        {
+            param = query.substr(pos, amp_pos - pos);
+            pos = amp_pos + 1;
+        }
+        
+        // 分割键值对
+        size_t eq_pos = param.find('=');
+        if (eq_pos == std::string::npos) continue;
+        
+        std::string key = param.substr(0, eq_pos);
+        std::string value = param.substr(eq_pos + 1);
+        
+        if (key == "xt")
+        {
+            // xt=urn:btih:<info_hash>
+            std::string prefix = "urn:btih:";
+            size_t hash_start = value.find(prefix);
+            if (hash_start != std::string::npos)
+            {
+                info_hash = value.substr(hash_start + prefix.size());
+            }
+        }
+        else if (key == "tr")
+        {
+            // tr=<tracker_url> (URL 编码)
+            tracker_url = url_decode(value);
+        }
+    }
+}
+
+/**
  * @brief 生成随机的 20 字节 peer_id
  * 
  * 格式: -CC0001-<12个随机字符>
@@ -1850,7 +1953,33 @@ int main(int argc, char* argv[])
         out.close();
 
     }
-    else
+    else if (command == "magnet_parse")
+    {
+        // ================================================================
+        // 处理 "magnet_parse" 命令 - 解析磁力链接
+        // ================================================================
+        // 磁力链接格式: magnet:?xt=urn:btih:<info_hash>&dn=<name>&tr=<tracker_url>
+        // - xt: info hash (40 字符十六进制)
+        // - dn: 文件名 (可选)
+        // - tr: tracker URL (URL 编码)
+        
+        if (argc < 3)
+        {
+            std::cerr << "Usage: " << argv[0] << " magnet_parse <magnet_link>" << std::endl;
+            return 1;
+        }
+        
+        std::string magnet_link = argv[2];
+        std::string info_hash, tracker_url;
+        
+        // 解析磁力链接
+        parse_magnet_link(magnet_link, info_hash, tracker_url);
+        
+        // 输出结果
+        std::cout << "Tracker URL: " << tracker_url << std::endl;
+        std::cout << "Info Hash: " << info_hash << std::endl;
+    } 
+    else 
     {
         // 未知命令，输出错误信息
         std::cerr << "unknown command: " << command << std::endl;
