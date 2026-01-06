@@ -2060,7 +2060,7 @@ int main(int argc, char* argv[])
         std::string my_peer_id = generate_peer_id();
         
         // 构建 tracker 请求 URL
-        // 注意：磁力链接没有 length 信息，使用 0 作为 left 参数
+        // 注意：磁力链接没有 length 信息，使用一个非零值作为 left 参数
         std::ostringstream url;
         url << tracker_url;
         url << "?info_hash=" << url_encode(info_hash);
@@ -2068,7 +2068,7 @@ int main(int argc, char* argv[])
         url << "&port=" << 6881;
         url << "&uploaded=" << 0;
         url << "&downloaded=" << 0;
-        url << "&left=" << 0;  // 磁力链接没有文件长度信息
+        url << "&left=" << 999;  // 必须大于 0 才能获取 peers
         url << "&compact=" << 1;
         
         // 发送 tracker 请求
