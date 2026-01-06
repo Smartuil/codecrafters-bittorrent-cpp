@@ -1382,6 +1382,59 @@ void send_metadata_request(SOCKET sock, int peer_metadata_id, int piece_index = 
     send_all(sock, message);
 }
 
+/**
+ * @brief 接收元数据数据消息
+ * 
+ * 元数据数据消息格式:
+ * - 4 字节: 消息长度
+ * - 1 字节: 消息 ID (20 = 扩展消息)
+ * - 1 字节: 扩展消息 ID (我们的 ut_metadata ID，即 1)
+ * - N 字节: Bencode 编码的字典 {'msg_type': 1, 'piece': 0, 'total_size': XXXX}
+ * - M 字节: metadata piece contents (实际的 info 字典数据)
+ * 
+ * @param sock 已连接的 socket
+ * @return std::string metadata 内容（info 字典的 bencode 编码）
+ */
+std::string recv_metadata_data(SOCKET sock)
+{
+    // 循环接收消息，直到收到 metadata data 消息 (ID=20, msg_type=1)
+    while (true)
+    {
+        PeerMessage msg = recv_peer_message(sock);
+        
+        if (msg.keepalive) continue;
+        
+        // 检查是否是扩展消息 (ID=20)
+        if (msg.id == 20 && !msg.payload.empty())
+        {
+            // 第一个字节是扩展消息 ID（应该是我们告诉对方的 ut_metadata ID = 1）
+            uint8_t ext_msg_id = static_cast<uint8_t>(msg.payload[0]);
+            
+            // 我们在扩展握手中告诉对方我们的 ut_metadata ID 是 1
+            if (ext_msg_id == 1)
+            {
+                // 剩余部分: bencode 字典 + metadata 内容
+                std::string rest = msg.payload.substr(1);
+                
+                // 解析 bencode 字典，获取其结束位置
+                size_t pos = 0;
+                json dict = decode_bencoded_value(rest, pos);
+                
+                // 检查 msg_type 是否为 1 (data)
+                if (dict.contains("msg_type") && dict["msg_type"].get<int>() == 1)
+                {
+                    // pos 现在指向 bencode 字典结束后的位置
+                    // 剩余部分就是 metadata piece contents
+                    std::string metadata = rest.substr(pos);
+                    return metadata;
+                }
+            }
+        }
+        
+        // 其他消息类型，继续等待
+    }
+}
+
 // ============================================================================
 // Peer 下载辅助函数（bitfield / interested / unchoke / request/piece）
 // ============================================================================
@@ -2333,7 +2386,8 @@ int main(int argc, char* argv[])
         // 3. 与 peer 建立连接并完成握手
         // 4. 发送/接收扩展握手
         // 5. 发送元数据请求
-        // 6. (后续阶段) 接收元数据并输出
+        // 6. 接收元数据数据消息并解析
+        // 7. 验证 info hash 并输出 torrent 信息
         
         if (argc < 3)
         {
@@ -2409,9 +2463,35 @@ int main(int argc, char* argv[])
         // 发送元数据请求 (msg_type=0, piece=0)
         send_metadata_request(sock, peer_metadata_id, 0);
         
-        // TODO: 后续阶段会接收元数据并输出
+        // 接收元数据数据消息
+        std::string metadata = recv_metadata_data(sock);
         
         closesocket(sock);
+        
+        // 验证 info hash
+        std::string computed_hash = SHA1::hash(metadata);
+        if (computed_hash != info_hash)
+        {
+            throw std::runtime_error("Metadata hash mismatch");
+        }
+        
+        // 解析 metadata（这是 info 字典的 bencode 编码）
+        json info = decode_bencoded_value(metadata);
+        
+        // 输出 torrent 信息
+        std::cout << "Tracker URL: " << tracker_url << std::endl;
+        std::cout << "Length: " << info["length"].get<int64_t>() << std::endl;
+        std::cout << "Info Hash: " << info_hash_hex << std::endl;
+        std::cout << "Piece Length: " << info["piece length"].get<int64_t>() << std::endl;
+        std::cout << "Piece Hashes:" << std::endl;
+        
+        // 输出每个 piece 的哈希值
+        std::string pieces = info["pieces"].get<std::string>();
+        for (size_t i = 0; i < pieces.size(); i += 20)
+        {
+            std::string piece_hash = pieces.substr(i, 20);
+            std::cout << to_hex(piece_hash) << std::endl;
+        }
     } 
     else 
     {
