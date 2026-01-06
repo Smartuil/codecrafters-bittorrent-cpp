@@ -1159,9 +1159,11 @@ std::string build_handshake(const std::string& info_hash, const std::string& pee
  * @param info_hash 20 字节的 info hash
  * @param my_peer_id 20 字节的本地 peer id
  * @param support_extensions 是否支持扩展协议
+ * @param peer_supports_extensions 输出: 对方是否支持扩展协议
  * @return std::string 对方的 peer id（20 字节）
  */
-std::string perform_handshake(SOCKET sock, const std::string& info_hash, const std::string& my_peer_id, bool support_extensions = false)
+std::string perform_handshake(SOCKET sock, const std::string& info_hash, const std::string& my_peer_id, 
+                              bool support_extensions = false, bool* peer_supports_extensions = nullptr)
 {
     std::string hs = build_handshake(info_hash, my_peer_id, support_extensions);
     send_all(sock, hs);
@@ -1172,9 +1174,134 @@ std::string perform_handshake(SOCKET sock, const std::string& info_hash, const s
         throw std::runtime_error("Invalid handshake response");
     }
 
+    // 检查对方是否支持扩展（保留位第 20 位）
+    // 
+    // 握手响应结构 (68 字节):
+    //   索引:    0      1-19              20-27        28-47        48-67
+    //          ┌───┬─────────────────┬────────────┬────────────┬────────────┐
+    //          │19 │BitTorrent proto │ 保留位(8B) │ info_hash  │  peer_id   │
+    //          └───┴─────────────────┴────────────┴────────────┴────────────┘
+    //           1B       19 字节          8 字节      20 字节      20 字节
+    //
+    // 保留位 (索引 20-27):
+    //   索引:   20   21   22   23   24   25   26   27
+    //         ┌────┬────┬────┬────┬────┬────┬────┬────┐
+    //         │ 00 │ 00 │ 00 │ 00 │ 00 │ 10 │ 00 │ 00 │  ← 支持扩展时
+    //         └────┴────┴────┴────┴────┴────┴────┴────┘
+    //                                   ↑
+    //                              response[25] = 0x10
+    //
+    // 第 20 位（从右数，从 0 开始）位于:
+    //   - 字节索引 25（从右数第 3 个字节: 27 - 20/8 = 25）
+    //   - 该字节内第 4 位（20 % 8 = 4，即 0x10 = 00010000）
+    if (peer_supports_extensions != nullptr)
+    {
+        unsigned char reserved_byte = static_cast<unsigned char>(response[25]);
+        *peer_supports_extensions = (reserved_byte & 0x10) != 0;
+    }
+
     // reserved(8) + info_hash(20) + peer_id(20)
     std::string received_peer_id = response.substr(48, 20);
     return received_peer_id;
+}
+
+// ============================================================================
+// Bencode 编码函数
+// ============================================================================
+
+/**
+ * @brief 将 JSON 对象编码为 Bencode 格式
+ */
+
+//  {"m": {"ut_metadata": 1}}
+//         ↓ bencode_encode
+// d                           ← 字典开始
+//   1:m                       ← 键 "m" (长度1)
+//   d                         ← 值是字典，字典开始
+//     11:ut_metadata          ← 键 "ut_metadata" (长度11)
+//     i1e                     ← 值 1 (整数)
+//   e                         ← 内层字典结束
+// e                           ← 外层字典结束
+
+// 最终: "d1:md11:ut_metadatai1eee"
+std::string bencode_encode(const json& j)
+{
+    if (j.is_string())
+    {
+        std::string s = j.get<std::string>();
+        return std::to_string(s.size()) + ":" + s;
+    }
+    else if (j.is_number_integer())
+    {
+        return "i" + std::to_string(j.get<int64_t>()) + "e";
+    }
+    else if (j.is_array())
+    {
+        std::string result = "l";
+        for (const auto& item : j)
+        {
+            result += bencode_encode(item);
+        }
+        result += "e";
+        return result;
+    }
+    else if (j.is_object())
+    {
+        std::string result = "d";
+        // 字典键必须按字典序排列
+        std::vector<std::string> keys;
+        for (auto it = j.begin(); it != j.end(); ++it)
+        {
+            keys.push_back(it.key());
+        }
+        std::sort(keys.begin(), keys.end());
+        
+        for (const auto& key : keys)
+        {
+            result += std::to_string(key.size()) + ":" + key;
+            result += bencode_encode(j[key]);
+        }
+        result += "e";
+        return result;
+    }
+    
+    throw std::runtime_error("Unsupported JSON type for bencode encoding");
+}
+
+// ============================================================================
+// 扩展协议相关函数
+// ============================================================================
+
+/**
+ * @brief 发送扩展握手消息
+ * 
+ * 扩展消息格式:
+ * - 4 字节: 消息长度
+ * - 1 字节: 消息 ID (20 = 扩展消息)
+ * - 1 字节: 扩展消息 ID (0 = 扩展握手)
+ * - N 字节: Bencode 编码的字典 {"m": {"ut_metadata": <ID>}}
+ */
+void send_extension_handshake(SOCKET sock)
+{
+    // 构建扩展握手字典
+    // {"m": {"ut_metadata": 1}}
+    json ext_handshake;
+    ext_handshake["m"]["ut_metadata"] = 1;  // 我们使用 ID 1 表示 ut_metadata
+    
+    std::string bencoded = bencode_encode(ext_handshake);
+    
+    // 构建完整消息
+    std::string message;
+    
+    // 消息长度 = 1 (消息ID) + 1 (扩展消息ID) + bencoded.size()
+    uint32_t length = static_cast<uint32_t>(2 + bencoded.size());
+    append_u32_be(message, length);
+    
+    message.push_back(static_cast<char>(20));  // 消息 ID = 20 (扩展消息)
+    message.push_back(static_cast<char>(0));   // 扩展消息 ID = 0 (扩展握手)
+    message += bencoded;
+    
+    send_all(sock, message);
 }
 
 // ============================================================================
@@ -2094,7 +2221,17 @@ int main(int argc, char* argv[])
         SOCKET sock = tcp_connect(peer_host, peer_port);
         
         // 执行握手（支持扩展协议）
-        std::string received_peer_id = perform_handshake(sock, info_hash, my_peer_id, true);
+        bool peer_supports_extensions = false;
+        std::string received_peer_id = perform_handshake(sock, info_hash, my_peer_id, true, &peer_supports_extensions);
+        
+        // 接收 bitfield 消息
+        (void)recv_bitfield_payload(sock);
+        
+        // 如果对方支持扩展，发送扩展握手
+        if (peer_supports_extensions)
+        {
+            send_extension_handshake(sock);
+        }
         
         closesocket(sock);
         
