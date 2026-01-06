@@ -1304,6 +1304,46 @@ void send_extension_handshake(SOCKET sock)
     send_all(sock, message);
 }
 
+/**
+ * @brief 接收扩展握手消息
+ * 
+ * 扩展握手消息格式:
+ * - 4 字节: 消息长度
+ * - 1 字节: 消息 ID (20 = 扩展消息)
+ * - 1 字节: 扩展消息 ID (0 = 扩展握手)
+ * - N 字节: Bencode 编码的字典 {"m": {"ut_metadata": <ID>}, ...}
+ * 
+ * @param sock 已连接的 socket
+ * @return json 解析后的扩展握手字典
+ */
+json recv_extension_handshake(SOCKET sock)
+{
+    // 循环接收消息，直到收到扩展握手消息 (ID=20, ExtID=0)
+    while (true)
+    {
+        PeerMessage msg = recv_peer_message(sock);
+        
+        if (msg.keepalive) continue;
+        
+        // 检查是否是扩展消息 (ID=20)
+        if (msg.id == 20 && !msg.payload.empty())
+        {
+            // 第一个字节是扩展消息 ID
+            uint8_t ext_msg_id = static_cast<uint8_t>(msg.payload[0]);
+            
+            // 扩展握手的扩展消息 ID 是 0
+            if (ext_msg_id == 0)
+            {
+                // 剩余部分是 Bencode 编码的字典
+                std::string bencoded = msg.payload.substr(1);
+                return decode_bencoded_value(bencoded);
+            }
+        }
+        
+        // 其他消息类型，继续等待
+    }
+}
+
 // ============================================================================
 // Peer 下载辅助函数（bitfield / interested / unchoke / request/piece）
 // ============================================================================
@@ -2231,12 +2271,19 @@ int main(int argc, char* argv[])
         if (peer_supports_extensions)
         {
             send_extension_handshake(sock);
+            
+            // 接收对方的扩展握手消息
+            json peer_ext_handshake = recv_extension_handshake(sock);
+            
+            // 提取对方的 ut_metadata ID
+            int peer_metadata_id = peer_ext_handshake["m"]["ut_metadata"].get<int>();
+            
+            // 输出对方的 peer id 和 metadata extension ID
+            std::cout << "Peer ID: " << to_hex(received_peer_id) << std::endl;
+            std::cout << "Peer Metadata Extension ID: " << peer_metadata_id << std::endl;
         }
         
         closesocket(sock);
-        
-        // 输出对方的 peer id
-        std::cout << "Peer ID: " << to_hex(received_peer_id) << std::endl;
     } 
     else 
     {
