@@ -1344,6 +1344,44 @@ json recv_extension_handshake(SOCKET sock)
     }
 }
 
+/**
+ * @brief 发送元数据请求消息
+ * 
+ * 元数据请求消息格式:
+ * - 4 字节: 消息长度
+ * - 1 字节: 消息 ID (20 = 扩展消息)
+ * - 1 字节: 扩展消息 ID (对方的 ut_metadata ID)
+ * - N 字节: Bencode 编码的字典 {"msg_type": 0, "piece": 0}
+ *           msg_type=0 表示请求消息
+ *           piece=0 表示请求第 0 个元数据分片
+ * 
+ * @param sock 已连接的 socket
+ * @param peer_metadata_id 对方的 ut_metadata 扩展 ID
+ * @param piece_index 要请求的元数据分片索引（通常为 0）
+ */
+void send_metadata_request(SOCKET sock, int peer_metadata_id, int piece_index = 0)
+{
+    // 构建请求字典 {"msg_type": 0, "piece": 0}
+    json request;
+    request["msg_type"] = 0;  // 0 = request
+    request["piece"] = piece_index;
+    
+    std::string bencoded = bencode_encode(request);
+    
+    // 构建完整消息
+    std::string message;
+    
+    // 消息长度 = 1 (消息ID) + 1 (扩展消息ID) + bencoded.size()
+    uint32_t length = static_cast<uint32_t>(2 + bencoded.size());
+    append_u32_be(message, length);
+    
+    message.push_back(static_cast<char>(20));  // 消息 ID = 20 (扩展消息)
+    message.push_back(static_cast<char>(peer_metadata_id));  // 对方的 ut_metadata ID
+    message += bencoded;
+    
+    send_all(sock, message);
+}
+
 // ============================================================================
 // Peer 下载辅助函数（bitfield / interested / unchoke / request/piece）
 // ============================================================================
@@ -2282,6 +2320,96 @@ int main(int argc, char* argv[])
             std::cout << "Peer ID: " << to_hex(received_peer_id) << std::endl;
             std::cout << "Peer Metadata Extension ID: " << peer_metadata_id << std::endl;
         }
+        
+        closesocket(sock);
+    }
+    else if (command == "magnet_info")
+    {
+        // ================================================================
+        // 处理 "magnet_info" 命令 - 从磁力链接获取 torrent 元数据
+        // ================================================================
+        // 1. 解析磁力链接获取 tracker URL 和 info hash
+        // 2. 向 tracker 发送请求获取 peers
+        // 3. 与 peer 建立连接并完成握手
+        // 4. 发送/接收扩展握手
+        // 5. 发送元数据请求
+        // 6. (后续阶段) 接收元数据并输出
+        
+        if (argc < 3)
+        {
+            std::cerr << "Usage: " << argv[0] << " magnet_info <magnet_link>" << std::endl;
+            return 1;
+        }
+        
+        std::string magnet_link = argv[2];
+        std::string info_hash_hex, tracker_url;
+        
+        // 解析磁力链接
+        parse_magnet_link(magnet_link, info_hash_hex, tracker_url);
+        
+        // 将十六进制 info hash 转换为 20 字节二进制
+        std::string info_hash = from_hex(info_hash_hex);
+        
+        // 生成 peer_id
+        std::string my_peer_id = generate_peer_id();
+        
+        // 构建 tracker 请求 URL
+        std::ostringstream url;
+        url << tracker_url;
+        url << "?info_hash=" << url_encode(info_hash);
+        url << "&peer_id=" << my_peer_id;
+        url << "&port=" << 6881;
+        url << "&uploaded=" << 0;
+        url << "&downloaded=" << 0;
+        url << "&left=" << 999;
+        url << "&compact=" << 1;
+        
+        // 发送 tracker 请求
+        std::string response = http_get(url.str());
+        json tracker_response = decode_bencoded_value(response);
+        
+        // 解析 peers
+        std::string peers_data = tracker_response["peers"].get<std::string>();
+        std::vector<std::string> peers = parse_peers(peers_data);
+        
+        if (peers.empty())
+        {
+            throw std::runtime_error("No peers found");
+        }
+        
+        // 连接到第一个 peer
+        std::string peer_addr = peers[0];
+        std::string peer_host;
+        int peer_port;
+        parse_host_port(peer_addr, peer_host, peer_port);
+        
+        // 建立 TCP 连接
+        SOCKET sock = tcp_connect(peer_host, peer_port);
+        
+        // 执行基础握手（支持扩展协议）
+        bool peer_supports_extensions = false;
+        (void)perform_handshake(sock, info_hash, my_peer_id, true, &peer_supports_extensions);
+        
+        // 接收 bitfield 消息
+        (void)recv_bitfield_payload(sock);
+        
+        if (!peer_supports_extensions)
+        {
+            closesocket(sock);
+            throw std::runtime_error("Peer does not support extensions");
+        }
+        
+        // 发送扩展握手
+        send_extension_handshake(sock);
+        
+        // 接收对方的扩展握手
+        json peer_ext_handshake = recv_extension_handshake(sock);
+        int peer_metadata_id = peer_ext_handshake["m"]["ut_metadata"].get<int>();
+        
+        // 发送元数据请求 (msg_type=0, piece=0)
+        send_metadata_request(sock, peer_metadata_id, 0);
+        
+        // TODO: 后续阶段会接收元数据并输出
         
         closesocket(sock);
     } 
