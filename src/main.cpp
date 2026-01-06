@@ -314,6 +314,26 @@ std::string to_hex(const std::string& binary)
 }
 
 /**
+ * @brief 将十六进制字符串转换为二进制数据
+ * @param hex 十六进制字符串（如 "d69f91e6..."）
+ * @return std::string 二进制数据
+ */
+std::string from_hex(const std::string& hex)
+{
+    std::string binary;
+    binary.reserve(hex.size() / 2);
+    
+    for (size_t i = 0; i + 1 < hex.size(); i += 2)
+    {
+        std::string byte_str = hex.substr(i, 2);
+        char byte = static_cast<char>(std::stoi(byte_str, nullptr, 16));
+        binary.push_back(byte);
+    }
+    
+    return binary;
+}
+
+/**
  * @brief 解码 Bencode 编码的值（带位置跟踪）
  * 
  * Bencode 支持四种数据类型：
@@ -1094,7 +1114,15 @@ void send_peer_message(SOCKET sock, uint8_t id, const std::string& payload)
     send_all(sock, out);
 }
 
-std::string build_handshake(const std::string& info_hash, const std::string& peer_id)
+/**
+ * @brief 构建 BitTorrent 握手消息
+ * 
+ * @param info_hash 20 字节的 info hash
+ * @param peer_id 20 字节的 peer id
+ * @param support_extensions 是否支持扩展协议（设置第 20 位）
+ * @return std::string 68 字节的握手消息
+ */
+std::string build_handshake(const std::string& info_hash, const std::string& peer_id, bool support_extensions = false)
 {
     if (info_hash.size() != 20) throw std::runtime_error("Invalid info_hash length");
     if (peer_id.size() != 20) throw std::runtime_error("Invalid peer_id length");
@@ -1103,15 +1131,39 @@ std::string build_handshake(const std::string& info_hash, const std::string& pee
     handshake.reserve(68);
     handshake.push_back(static_cast<char>(19));
     handshake += "BitTorrent protocol";
-    handshake.append(8, '\0');
+    
+    // 8 字节保留位
+    // 如果支持扩展，设置第 20 位（从右边数，从 0 开始）
+    // 第 20 位在第 6 个字节（索引 5）的第 4 位
+    // 00 00 00 00 00 10 00 00 (hex)
+    if (support_extensions)
+    {
+        handshake.append(5, '\0');           // 前 5 字节为 0
+        handshake.push_back('\x10');         // 第 6 字节 = 0x10 (00010000)
+        handshake.append(2, '\0');           // 后 2 字节为 0
+    }
+    else
+    {
+        handshake.append(8, '\0');           // 全部为 0
+    }
+    
     handshake += info_hash;
     handshake += peer_id;
     return handshake;
 }
 
-std::string perform_handshake(SOCKET sock, const std::string& info_hash, const std::string& my_peer_id)
+/**
+ * @brief 执行 BitTorrent 握手
+ * 
+ * @param sock 已连接的 socket
+ * @param info_hash 20 字节的 info hash
+ * @param my_peer_id 20 字节的本地 peer id
+ * @param support_extensions 是否支持扩展协议
+ * @return std::string 对方的 peer id（20 字节）
+ */
+std::string perform_handshake(SOCKET sock, const std::string& info_hash, const std::string& my_peer_id, bool support_extensions = false)
 {
-    std::string hs = build_handshake(info_hash, my_peer_id);
+    std::string hs = build_handshake(info_hash, my_peer_id, support_extensions);
     send_all(sock, hs);
 
     std::string response = recv_exact(sock, 68);
@@ -1978,6 +2030,76 @@ int main(int argc, char* argv[])
         // 输出结果
         std::cout << "Tracker URL: " << tracker_url << std::endl;
         std::cout << "Info Hash: " << info_hash << std::endl;
+    }
+    else if (command == "magnet_handshake")
+    {
+        // ================================================================
+        // 处理 "magnet_handshake" 命令 - 磁力链接握手
+        // ================================================================
+        // 1. 解析磁力链接获取 tracker URL 和 info hash
+        // 2. 向 tracker 发送请求获取 peers
+        // 3. 与 peer 建立 TCP 连接并进行握手（支持扩展）
+        // 4. 输出对方的 peer id
+        
+        if (argc < 3)
+        {
+            std::cerr << "Usage: " << argv[0] << " magnet_handshake <magnet_link>" << std::endl;
+            return 1;
+        }
+        
+        std::string magnet_link = argv[2];
+        std::string info_hash_hex, tracker_url;
+        
+        // 解析磁力链接
+        parse_magnet_link(magnet_link, info_hash_hex, tracker_url);
+        
+        // 将十六进制 info hash 转换为 20 字节二进制
+        std::string info_hash = from_hex(info_hash_hex);
+        
+        // 生成 peer_id
+        std::string my_peer_id = generate_peer_id();
+        
+        // 构建 tracker 请求 URL
+        // 注意：磁力链接没有 length 信息，使用 0 作为 left 参数
+        std::ostringstream url;
+        url << tracker_url;
+        url << "?info_hash=" << url_encode(info_hash);
+        url << "&peer_id=" << my_peer_id;
+        url << "&port=" << 6881;
+        url << "&uploaded=" << 0;
+        url << "&downloaded=" << 0;
+        url << "&left=" << 0;  // 磁力链接没有文件长度信息
+        url << "&compact=" << 1;
+        
+        // 发送 tracker 请求
+        std::string response = http_get(url.str());
+        json tracker_response = decode_bencoded_value(response);
+        
+        // 解析 peers
+        std::string peers_data = tracker_response["peers"].get<std::string>();
+        std::vector<std::string> peers = parse_peers(peers_data);
+        
+        if (peers.empty())
+        {
+            throw std::runtime_error("No peers found");
+        }
+        
+        // 连接到第一个 peer
+        std::string peer_addr = peers[0];
+        std::string peer_host;
+        int peer_port;
+        parse_host_port(peer_addr, peer_host, peer_port);
+        
+        // 建立 TCP 连接
+        SOCKET sock = tcp_connect(peer_host, peer_port);
+        
+        // 执行握手（支持扩展协议）
+        std::string received_peer_id = perform_handshake(sock, info_hash, my_peer_id, true);
+        
+        closesocket(sock);
+        
+        // 输出对方的 peer id
+        std::cout << "Peer ID: " << to_hex(received_peer_id) << std::endl;
     } 
     else 
     {
