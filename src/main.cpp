@@ -2492,6 +2492,176 @@ int main(int argc, char* argv[])
             std::string piece_hash = pieces.substr(i, 20);
             std::cout << to_hex(piece_hash) << std::endl;
         }
+    }
+    else if (command == "magnet_download_piece")
+    {
+        // ================================================================
+        // 处理 "magnet_download_piece" 命令 - 从磁力链接下载指定 piece
+        // ================================================================
+        // 用法:
+        //   ./your_program magnet_download_piece -o <output_path> <magnet_link> <piece_index>
+        //
+        // 流程:
+        //   1. 解析磁力链接获取 tracker URL 和 info hash
+        //   2. 向 tracker 发送请求获取 peers
+        //   3. 与 peer 建立连接并完成握手
+        //   4. 发送/接收扩展握手
+        //   5. 获取 info 字典（使用 metadata 扩展）
+        //   6. 下载指定 piece 的 blocks
+        //   7. 保存 piece 到磁盘
+        
+        if (argc < 6 || std::string(argv[2]) != "-o")
+        {
+            std::cerr << "Usage: " << argv[0] << " magnet_download_piece -o <output_path> <magnet_link> <piece_index>" << std::endl;
+            return 1;
+        }
+        
+        std::string output_path = argv[3];
+        std::string magnet_link = argv[4];
+        int piece_index = std::stoi(argv[5]);
+        
+        if (piece_index < 0)
+        {
+            throw std::runtime_error("Invalid piece_index");
+        }
+        
+        std::string info_hash_hex, tracker_url;
+        
+        // 1. 解析磁力链接
+        parse_magnet_link(magnet_link, info_hash_hex, tracker_url);
+        
+        // 将十六进制 info hash 转换为 20 字节二进制
+        std::string info_hash = from_hex(info_hash_hex);
+        
+        // 生成 peer_id
+        std::string my_peer_id = generate_peer_id();
+        
+        // 2. 构建 tracker 请求 URL
+        std::ostringstream url;
+        url << tracker_url;
+        url << "?info_hash=" << url_encode(info_hash);
+        url << "&peer_id=" << my_peer_id;
+        url << "&port=" << 6881;
+        url << "&uploaded=" << 0;
+        url << "&downloaded=" << 0;
+        url << "&left=" << 999;
+        url << "&compact=" << 1;
+        
+        // 发送 tracker 请求
+        std::string response = http_get(url.str());
+        json tracker_response = decode_bencoded_value(response);
+        
+        // 解析 peers
+        std::string peers_data = tracker_response["peers"].get<std::string>();
+        std::vector<std::string> peers = parse_peers(peers_data);
+        
+        if (peers.empty())
+        {
+            throw std::runtime_error("No peers found");
+        }
+        
+        // 连接到第一个 peer
+        std::string peer_addr = peers[0];
+        std::string peer_host;
+        int peer_port;
+        parse_host_port(peer_addr, peer_host, peer_port);
+        
+        SOCKET sock = INVALID_SOCKET;
+        try
+        {
+            // 3. 建立 TCP 连接
+            sock = tcp_connect(peer_host, peer_port);
+            
+            // 执行基础握手（支持扩展协议）
+            bool peer_supports_extensions = false;
+            (void)perform_handshake(sock, info_hash, my_peer_id, true, &peer_supports_extensions);
+            
+            // 接收 bitfield 消息
+            (void)recv_bitfield_payload(sock);
+            
+            if (!peer_supports_extensions)
+            {
+                throw std::runtime_error("Peer does not support extensions");
+            }
+            
+            // 4. 发送扩展握手
+            send_extension_handshake(sock);
+            
+            // 接收对方的扩展握手
+            json peer_ext_handshake = recv_extension_handshake(sock);
+            int peer_metadata_id = peer_ext_handshake["m"]["ut_metadata"].get<int>();
+            
+            // 5. 获取 info 字典（使用 metadata 扩展）
+            send_metadata_request(sock, peer_metadata_id, 0);
+            std::string metadata = recv_metadata_data(sock);
+            
+            // 验证 info hash
+            std::string computed_hash = SHA1::hash(metadata);
+            if (computed_hash != info_hash)
+            {
+                throw std::runtime_error("Metadata hash mismatch");
+            }
+            
+            // 解析 metadata（这是 info 字典的 bencode 编码）
+            json info = decode_bencoded_value(metadata);
+            
+            // 提取 torrent 信息
+            int64_t total_length = info["length"].get<int64_t>();
+            int64_t piece_length = info["piece length"].get<int64_t>();
+            std::string pieces_blob = info["pieces"].get<std::string>();
+            
+            // piece 边界检查 + 计算本 piece 实际长度
+            int64_t num_pieces = static_cast<int64_t>(pieces_blob.size() / 20);
+            if (piece_index >= num_pieces)
+            {
+                throw std::runtime_error("piece_index out of range");
+            }
+            
+            int64_t piece_offset = static_cast<int64_t>(piece_index) * piece_length;
+            if (piece_offset >= total_length)
+            {
+                throw std::runtime_error("piece_index out of file range");
+            }
+            
+            int64_t piece_size = std::min(piece_length, total_length - piece_offset);
+            std::string expected_piece_hash = pieces_blob.substr(static_cast<size_t>(piece_index) * 20, 20);
+            
+            // 6. 发送 interested 消息
+            send_peer_message(sock, 2, "");
+            
+            // 等待 unchoke
+            wait_for_unchoke(sock);
+            
+            // 下载 piece 数据（按 16KiB block 分段请求）
+            std::string piece_data = download_piece_from_peer(sock, piece_index, piece_size);
+            
+            // 校验 piece hash
+            std::string actual_hash = SHA1::hash(piece_data);
+            if (actual_hash != expected_piece_hash)
+            {
+                throw std::runtime_error("Piece hash mismatch");
+            }
+            
+            // 7. 写入文件
+            std::ofstream out(output_path, std::ios::binary);
+            if (!out)
+            {
+                throw std::runtime_error("Failed to open output file: " + output_path);
+            }
+            out.write(piece_data.data(), static_cast<std::streamsize>(piece_data.size()));
+            out.close();
+            
+            closesocket(sock);
+            sock = INVALID_SOCKET;
+        }
+        catch (...)
+        {
+            if (sock != INVALID_SOCKET)
+            {
+                closesocket(sock);
+            }
+            throw;
+        }
     } 
     else 
     {
