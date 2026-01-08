@@ -2662,6 +2662,208 @@ int main(int argc, char* argv[])
             }
             throw;
         }
+    }
+    else if (command == "magnet_download")
+    {
+        // ================================================================
+        // 处理 "magnet_download" 命令 - 从磁力链接下载整个文件
+        // ================================================================
+        // 用法:
+        //   ./your_program magnet_download -o <output_path> <magnet_link>
+        //
+        // 流程:
+        //   1. 解析磁力链接获取 tracker URL 和 info hash
+        //   2. 向 tracker 发送请求获取 peers
+        //   3. 获取 metadata（通过扩展协议）
+        //   4. 并发下载所有 pieces
+        //   5. 拼接所有 pieces 并保存到磁盘
+        
+        if (argc < 5 || std::string(argv[2]) != "-o")
+        {
+            std::cerr << "Usage: " << argv[0] << " magnet_download -o <output_path> <magnet_link>" << std::endl;
+            return 1;
+        }
+        
+        std::string output_path = argv[3];
+        std::string magnet_link = argv[4];
+        
+        std::string info_hash_hex, tracker_url;
+        
+        // 1. 解析磁力链接
+        parse_magnet_link(magnet_link, info_hash_hex, tracker_url);
+        
+        // 将十六进制 info hash 转换为 20 字节二进制
+        std::string info_hash = from_hex(info_hash_hex);
+        
+        // 生成 peer_id
+        std::string my_peer_id = generate_peer_id();
+        
+        // 2. 构建 tracker 请求 URL
+        std::ostringstream url;
+        url << tracker_url;
+        url << "?info_hash=" << url_encode(info_hash);
+        url << "&peer_id=" << my_peer_id;
+        url << "&port=" << 6881;
+        url << "&uploaded=" << 0;
+        url << "&downloaded=" << 0;
+        url << "&left=" << 999;
+        url << "&compact=" << 1;
+        
+        // 发送 tracker 请求
+        std::string response = http_get(url.str());
+        json tracker_response = decode_bencoded_value(response);
+        
+        // 解析 peers
+        std::string peers_data = tracker_response["peers"].get<std::string>();
+        std::vector<std::string> peers = parse_peers(peers_data);
+        
+        if (peers.empty())
+        {
+            throw std::runtime_error("No peers found");
+        }
+        
+        // 3. 获取 metadata（使用第一个 peer）
+        std::string peer_addr = peers[0];
+        std::string peer_host;
+        int peer_port;
+        parse_host_port(peer_addr, peer_host, peer_port);
+        
+        SOCKET metadata_sock = INVALID_SOCKET;
+        json info;
+        int64_t total_length = 0;
+        int64_t piece_length = 0;
+        std::string pieces_blob;
+        
+        try
+        {
+            // 建立连接获取 metadata
+            metadata_sock = tcp_connect(peer_host, peer_port);
+            
+            // 执行基础握手（支持扩展协议）
+            bool peer_supports_extensions = false;
+            (void)perform_handshake(metadata_sock, info_hash, my_peer_id, true, &peer_supports_extensions);
+            
+            // 接收 bitfield 消息
+            (void)recv_bitfield_payload(metadata_sock);
+            
+            if (!peer_supports_extensions)
+            {
+                throw std::runtime_error("Peer does not support extensions");
+            }
+            
+            // 发送扩展握手
+            send_extension_handshake(metadata_sock);
+            
+            // 接收对方的扩展握手
+            json peer_ext_handshake = recv_extension_handshake(metadata_sock);
+            int peer_metadata_id = peer_ext_handshake["m"]["ut_metadata"].get<int>();
+            
+            // 获取 info 字典（使用 metadata 扩展）
+            send_metadata_request(metadata_sock, peer_metadata_id, 0);
+            std::string metadata = recv_metadata_data(metadata_sock);
+            
+            closesocket(metadata_sock);
+            metadata_sock = INVALID_SOCKET;
+            
+            // 验证 info hash
+            std::string computed_hash = SHA1::hash(metadata);
+            if (computed_hash != info_hash)
+            {
+                throw std::runtime_error("Metadata hash mismatch");
+            }
+            
+            // 解析 metadata（这是 info 字典的 bencode 编码）
+            info = decode_bencoded_value(metadata);
+            
+            // 提取 torrent 信息
+            total_length = info["length"].get<int64_t>();
+            piece_length = info["piece length"].get<int64_t>();
+            pieces_blob = info["pieces"].get<std::string>();
+        }
+        catch (...)
+        {
+            if (metadata_sock != INVALID_SOCKET)
+            {
+                closesocket(metadata_sock);
+            }
+            throw;
+        }
+        
+        // 4. 并发下载所有 pieces
+        int64_t num_pieces = static_cast<int64_t>(pieces_blob.size() / 20);
+        if (num_pieces <= 0)
+        {
+            throw std::runtime_error("Invalid pieces field");
+        }
+        
+        // 为了支持并发写入，把整文件先装到内存缓冲区
+        if (total_length < 0)
+        {
+            throw std::runtime_error("Invalid total length");
+        }
+        std::vector<char> file_data;
+        file_data.resize(static_cast<size_t>(total_length));
+        
+        PieceWorkQueue queue(num_pieces);
+        
+        // 分批启动 worker：每个 worker 使用一个 peer 连接
+        const size_t max_workers = 4;
+        size_t next_peer = 0;
+        std::string last_error;
+        std::mutex err_mu;
+        
+        while (queue.remaining.load() > 0 && next_peer < peers.size())
+        {
+            size_t batch = std::min(max_workers, peers.size() - next_peer);
+            std::vector<std::thread> threads;
+            threads.reserve(batch);
+            
+            for (size_t i = 0; i < batch; i++)
+            {
+                const std::string worker_peer_addr = peers[next_peer + i];
+                threads.emplace_back([&, worker_peer_addr]() {
+                    try
+                    {
+                        download_worker(worker_peer_addr, info_hash, my_peer_id, total_length, piece_length, pieces_blob, &queue, &file_data);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        std::lock_guard<std::mutex> lock(err_mu);
+                        if (last_error.empty()) last_error = e.what();
+                    }
+                    catch (...)
+                    {
+                        std::lock_guard<std::mutex> lock(err_mu);
+                        if (last_error.empty()) last_error = "worker failed";
+                    }
+                });
+            }
+            
+            for (auto& t : threads)
+            {
+                t.join();
+            }
+            
+            next_peer += batch;
+        }
+        
+        if (queue.remaining.load() > 0)
+        {
+            throw std::runtime_error(last_error.empty() ? "Download incomplete" : last_error);
+        }
+        
+        // 5. 所有 pieces 完成后写入文件
+        std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
+        if (!out)
+        {
+            throw std::runtime_error("Failed to open output file: " + output_path);
+        }
+        out.write(file_data.data(), static_cast<std::streamsize>(file_data.size()));
+        if (!out)
+        {
+            throw std::runtime_error("Failed to write output file");
+        }
+        out.close();
     } 
     else 
     {
